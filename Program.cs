@@ -92,6 +92,8 @@ builder.Services.AddAuthorization();
 builder.Services.AddHttpClient<IUserSyncService, UserSyncService>();
 builder.Services.AddScoped<IUserSyncService, UserSyncService>();
 
+//listen port 80
+
 builder.WebHost.UseUrls("http://0.0.0.0:80");
 
 var app = builder.Build();
