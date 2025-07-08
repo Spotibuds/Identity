@@ -13,6 +13,11 @@ env:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    services:
+      docker:
+        image: docker:20.10.7
+        options: --privileged
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
