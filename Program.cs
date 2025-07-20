@@ -7,6 +7,13 @@ using DotNetEnv;
 
 Env.Load();
 
+// Print all environment variables for debugging
+foreach (System.Collections.DictionaryEntry env in Environment.GetEnvironmentVariables())
+{
+    Console.WriteLine($"{env.Key} = {env.Value}");
+}
+Console.WriteLine("DefaultConnection: " + Environment.GetEnvironmentVariable("DefaultConnection"));
+
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddControllers();
