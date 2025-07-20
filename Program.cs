@@ -3,6 +3,9 @@ using Microsoft.AspNetCore.Identity;
 using Identity.Data;
 using Identity.Services;
 using Identity;
+using DotNetEnv;
+
+Env.Load();
 
 var builder = WebApplication.CreateBuilder(args);
 
