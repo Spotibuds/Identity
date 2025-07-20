@@ -11,6 +11,8 @@ using System.Text;
 using System.ComponentModel.DataAnnotations;
 using System.Security.Cryptography;
 using Microsoft.EntityFrameworkCore;
+using MongoDB.Bson;
+using MongoDB.Driver;
 
 namespace Identity.Controllers;
 
@@ -63,7 +65,7 @@ public class AuthController : ControllerBase
 
         var jwtSection = _configuration.GetSection("Jwt");
         var secret = jwtSection["Secret"];
-        
+
         if (string.IsNullOrWhiteSpace(secret))
         {
             throw new InvalidOperationException("JWT secret key is not configured");
@@ -137,7 +139,6 @@ public class AuthController : ControllerBase
             if (result.Succeeded)
             {
                 await _userManager.AddToRoleAsync(user, "User");
-                
                 try
                 {
                     await _userSyncService.SyncUserToMongoDbAsync(user);
@@ -485,7 +486,6 @@ public class AuthController : ControllerBase
             var jwtToken = await GenerateJwtTokenAsync(user);
             var newRefreshToken = await CreateRefreshTokenAsync(user);
 
-            // Revoke the old refresh token
             refreshToken.IsRevoked = true;
             await _dbContext.SaveChangesAsync();
 
@@ -623,4 +623,4 @@ public class RefreshTokenDto
 {
     [Required]
     public string RefreshToken { get; set; } = string.Empty;
-} 
+}

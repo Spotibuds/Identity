@@ -1,6 +1,8 @@
 using Identity.Entities;
 using System.Text;
 using System.Text.Json;
+using MongoDB.Bson;
+using MongoDB.Driver;
 
 namespace Identity.Services;
 
@@ -8,41 +10,31 @@ public class UserSyncService : IUserSyncService
 {
     private readonly HttpClient _httpClient;
     private readonly ILogger<UserSyncService> _logger;
-    private readonly string _userServiceUrl;
+    private readonly IMongoCollection<BsonDocument> _usersCollection;
 
     public UserSyncService(HttpClient httpClient, ILogger<UserSyncService> logger, IConfiguration configuration)
     {
         _httpClient = httpClient;
         _logger = logger;
-        _userServiceUrl = configuration.GetConnectionString("UserService") ?? "http://localhost:5003";
+        var mongoConnectionString = configuration.GetConnectionString("MongoDb");
+        var mongoClient = new MongoClient(mongoConnectionString);
+        var mongoDatabase = mongoClient.GetDatabase("spotibuds");
+        _usersCollection = mongoDatabase.GetCollection<BsonDocument>("users");
     }
 
     public async Task SyncUserToMongoDbAsync(User identityUser)
     {
         try
         {
-            var createUserDto = new CreateUserForMongoDto
+            var userDoc = new BsonDocument
             {
-                IdentityUserId = identityUser.Id.ToString(),
-                UserName = identityUser.UserName ?? string.Empty,
-                IsPrivate = identityUser.IsPrivate
+                { "IdentityUserId", identityUser.Id.ToString() },
+                { "UserName", identityUser.UserName ?? string.Empty },
+                { "Email", identityUser.Email ?? string.Empty },
+                { "IsPrivate", identityUser.IsPrivate }
             };
-
-            var json = JsonSerializer.Serialize(createUserDto);
-            var content = new StringContent(json, Encoding.UTF8, "application/json");
-
-            var response = await _httpClient.PostAsync($"{_userServiceUrl}/api/users", content);
-
-            if (response.IsSuccessStatusCode)
-            {
-                _logger.LogInformation("Successfully synced user {UserId} to MongoDB", identityUser.Id);
-            }
-            else
-            {
-                var errorContent = await response.Content.ReadAsStringAsync();
-                _logger.LogError("Failed to sync user {UserId} to MongoDB. Status: {StatusCode}, Error: {Error}", 
-                    identityUser.Id, response.StatusCode, errorContent);
-            }
+            await _usersCollection.InsertOneAsync(userDoc);
+            _logger.LogInformation("Successfully synced user {UserId} to MongoDB", identityUser.Id);
         }
         catch (Exception ex)
         {
@@ -54,41 +46,20 @@ public class UserSyncService : IUserSyncService
     {
         try
         {
-            var findResponse = await _httpClient.GetAsync($"{_userServiceUrl}/api/users/identity/{identityUser.Id}");
-            
-            if (!findResponse.IsSuccessStatusCode)
+            var filter = Builders<BsonDocument>.Filter.Eq("IdentityUserId", identityUser.Id.ToString());
+            var update = Builders<BsonDocument>.Update
+                .Set("UserName", identityUser.UserName ?? string.Empty)
+                .Set("Email", identityUser.Email ?? string.Empty)
+                .Set("IsPrivate", identityUser.IsPrivate);
+            var result = await _usersCollection.UpdateOneAsync(filter, update);
+            if (result.MatchedCount == 0)
             {
                 _logger.LogWarning("User {UserId} not found in MongoDB, creating new entry", identityUser.Id);
                 await SyncUserToMongoDbAsync(identityUser);
-                return;
             }
-
-            var mongoUserJson = await findResponse.Content.ReadAsStringAsync();
-            var mongoUser = JsonSerializer.Deserialize<MongoUserDto>(mongoUserJson);
-
-            if (mongoUser != null)
+            else
             {
-                var updateUserDto = new UpdateUserForMongoDto
-                {
-                    UserName = identityUser.UserName,
-                    IsPrivate = identityUser.IsPrivate
-                };
-
-                var json = JsonSerializer.Serialize(updateUserDto);
-                var content = new StringContent(json, Encoding.UTF8, "application/json");
-
-                var response = await _httpClient.PutAsync($"{_userServiceUrl}/api/users/{mongoUser.Id}", content);
-
-                if (response.IsSuccessStatusCode)
-                {
-                    _logger.LogInformation("Successfully updated user {UserId} in MongoDB", identityUser.Id);
-                }
-                else
-                {
-                    var errorContent = await response.Content.ReadAsStringAsync();
-                    _logger.LogError("Failed to update user {UserId} in MongoDB. Status: {StatusCode}, Error: {Error}", 
-                        identityUser.Id, response.StatusCode, errorContent);
-                }
+                _logger.LogInformation("Successfully updated user {UserId} in MongoDB", identityUser.Id);
             }
         }
         catch (Exception ex)
@@ -101,36 +72,20 @@ public class UserSyncService : IUserSyncService
     {
         try
         {
-            var findResponse = await _httpClient.GetAsync($"{_userServiceUrl}/api/users/identity/{identityUserId}");
-            
-            if (!findResponse.IsSuccessStatusCode)
+            var filter = Builders<BsonDocument>.Filter.Eq("IdentityUserId", identityUserId);
+            var result = await _usersCollection.DeleteOneAsync(filter);
+            if (result.DeletedCount == 0)
             {
                 _logger.LogWarning("User {UserId} not found in MongoDB for deletion", identityUserId);
-                return;
             }
-
-            var mongoUserJson = await findResponse.Content.ReadAsStringAsync();
-            var mongoUser = JsonSerializer.Deserialize<MongoUserDto>(mongoUserJson);
-
-            if (mongoUser != null)
+            else
             {
-                var response = await _httpClient.DeleteAsync($"{_userServiceUrl}/api/users/{mongoUser.Id}");
-
-                if (response.IsSuccessStatusCode)
-                {
-                    _logger.LogInformation("Successfully deleted user {UserId} from MongoDB", identityUserId);
-                }
-                else
-                {
-                    var errorContent = await response.Content.ReadAsStringAsync();
-                    _logger.LogError("Failed to delete user {UserId} from MongoDB. Status: {StatusCode}, Error: {Error}", 
-                        identityUserId, response.StatusCode, errorContent);
-                }
+                _logger.LogInformation("Successfully deleted user {UserId} from MongoDB", identityUserId);
             }
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Exception occurred while deleting user {UserId} from MongoDB", identityUserId);
+            _logger.LogError(ex, "Exception occurred while deleting user {UserId} in MongoDB", identityUserId);
         }
     }
 }
