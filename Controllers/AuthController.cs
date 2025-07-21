@@ -196,11 +196,14 @@ public class AuthController : ControllerBase
                 message = "Login successful",
                 token = jwtToken,
                 refreshToken = refreshToken.Token,
-                userId = user.Id,
-                username = user.UserName,
-                email = user.Email,
-                isPrivate = user.IsPrivate,
-                roles = roles
+                user = new {
+                    id = user.Id,
+                    username = user.UserName,
+                    email = user.Email,
+                    isPrivate = user.IsPrivate,
+                    createdAt = user.CreatedAt,
+                    roles = roles
+                }
             });
         }
         catch (Exception ex)
