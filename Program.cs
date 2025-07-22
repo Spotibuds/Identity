@@ -14,11 +14,11 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
 builder.Services.AddDbContext<IdentityDbContext>(options =>
-    options.UseNpgsql(builder.Configuration["ConnectionStrings:DefaultConnection"]));
+    options.UseNpgsql(Env.GetString("ConnectionStrings__DefaultConnection")));
 
-builder.Services.AddIdentityServices(builder.Configuration);
+builder.Services.AddIdentityServices();
 
-builder.Services.AddSpotibudsCors(builder.Configuration);
+builder.Services.AddSpotibudsCors();
 
 builder.Services.AddAuthorization();
 
