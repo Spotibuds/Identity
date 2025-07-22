@@ -3,9 +3,6 @@ using Microsoft.AspNetCore.Identity;
 using Identity.Data;
 using Identity.Services;
 using Identity;
-using DotNetEnv;
-
-Env.Load();
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -14,11 +11,11 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
 builder.Services.AddDbContext<IdentityDbContext>(options =>
-    options.UseNpgsql(Env.GetString("ConnectionStrings__DefaultConnection")));
+    options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection")));
 
-builder.Services.AddIdentityServices();
+builder.Services.AddIdentityServices(builder.Configuration);
 
-builder.Services.AddSpotibudsCors();
+builder.Services.AddSpotibudsCors(builder.Configuration);
 
 builder.Services.AddAuthorization();
 

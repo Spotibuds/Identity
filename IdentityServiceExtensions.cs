@@ -3,13 +3,12 @@ using Microsoft.IdentityModel.Tokens;
 using Identity.Data;
 using Identity.Entities;
 using System.Text;
-using DotNetEnv;
 
 namespace Identity
 {
     public static class IdentityServiceExtensions
     {
-        public static IServiceCollection AddIdentityServices(this IServiceCollection services)
+        public static IServiceCollection AddIdentityServices(this IServiceCollection services, IConfiguration configuration)
         {
             services.AddIdentity<User, IdentityRole<Guid>>(options =>
             {
@@ -30,7 +29,7 @@ namespace Identity
             .AddEntityFrameworkStores<IdentityDbContext>()
             .AddDefaultTokenProviders();
 
-            var secretKey = Env.GetString("Jwt__Secret") ?? throw new InvalidOperationException("JWT Secret not configured");
+            var secretKey = configuration["Jwt:Secret"] ?? throw new InvalidOperationException("JWT Secret not configured");
             if (secretKey.Length < 32)
             {
                 throw new InvalidOperationException("JWT Secret must be at least 32 characters long");
@@ -49,8 +48,8 @@ namespace Identity
                     ValidateAudience = true,
                     ValidateLifetime = true,
                     ValidateIssuerSigningKey = true,
-                    ValidIssuer = Env.GetString("Jwt__Issuer"),
-                    ValidAudience = Env.GetString("Jwt__Audience"),
+                    ValidIssuer = configuration["Jwt:Issuer"],
+                    ValidAudience = configuration["Jwt:Audience"],
                     IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey)),
                     ClockSkew = TimeSpan.FromMinutes(5)
                 };
@@ -59,9 +58,9 @@ namespace Identity
             return services;
         }
 
-        public static IServiceCollection AddSpotibudsCors(this IServiceCollection services)
+        public static IServiceCollection AddSpotibudsCors(this IServiceCollection services, IConfiguration configuration)
         {
-            var allowedOrigins = Env.GetString("Cors__AllowedOrigins");
+            var allowedOrigins = configuration["Cors:AllowedOrigins"];
 
             services.AddCors(options =>
             {
