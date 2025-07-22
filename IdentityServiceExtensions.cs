@@ -66,23 +66,12 @@ namespace Identity
             {
                 options.AddPolicy("SpotibudsPolicy", policy =>
                 {
-                    if (allowedOrigins == "*")
-                    {
-                        policy.AllowAnyOrigin()
-                            .AllowAnyHeader()
-                            .AllowAnyMethod();
-                    }
-                    else
-                    {
-                        var origins = allowedOrigins?.Split(',') ?? Array.Empty<string>();
-                        policy.WithOrigins(origins)
-                            .AllowAnyHeader()
-                            .AllowAnyMethod()
-                            .AllowCredentials();
-                    }
+                    policy.AllowAnyOrigin()
+                        .AllowAnyHeader()
+                        .AllowAnyMethod();
                 });
             });
             return services;
         }
     }
-} 
+}
