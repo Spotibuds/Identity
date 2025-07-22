@@ -7,13 +7,6 @@ using DotNetEnv;
 
 Env.Load();
 
-// Print all environment variables for debugging
-foreach (System.Collections.DictionaryEntry env in Environment.GetEnvironmentVariables())
-{
-    Console.WriteLine($"{env.Key} = {env.Value}");
-}
-Console.WriteLine("DefaultConnection: " + Environment.GetEnvironmentVariable("DefaultConnection"));
-
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddControllers();
@@ -21,7 +14,7 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
 builder.Services.AddDbContext<IdentityDbContext>(options =>
-    options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection")));
+    options.UseNpgsql(builder.Configuration["ConnectionStrings:DefaultConnection"]));
 
 builder.Services.AddIdentityServices(builder.Configuration);
 

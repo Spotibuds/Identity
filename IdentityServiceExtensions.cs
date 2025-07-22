@@ -29,8 +29,7 @@ namespace Identity
             .AddEntityFrameworkStores<IdentityDbContext>()
             .AddDefaultTokenProviders();
 
-            var jwtSettings = configuration.GetSection("Jwt");
-            var secretKey = jwtSettings["Secret"] ?? throw new InvalidOperationException("JWT Secret not configured");
+            var secretKey = configuration["Jwt:Secret"] ?? throw new InvalidOperationException("JWT Secret not configured");
             if (secretKey.Length < 32)
             {
                 throw new InvalidOperationException("JWT Secret must be at least 32 characters long");
@@ -49,8 +48,8 @@ namespace Identity
                     ValidateAudience = true,
                     ValidateLifetime = true,
                     ValidateIssuerSigningKey = true,
-                    ValidIssuer = jwtSettings["Issuer"],
-                    ValidAudience = jwtSettings["Audience"],
+                    ValidIssuer = configuration["Jwt:Issuer"],
+                    ValidAudience = configuration["Jwt:Audience"],
                     IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey)),
                     ClockSkew = TimeSpan.FromMinutes(5)
                 };
@@ -61,8 +60,7 @@ namespace Identity
 
         public static IServiceCollection AddSpotibudsCors(this IServiceCollection services, IConfiguration configuration)
         {
-            var corsSection = configuration.GetSection("Cors");
-            var allowedOrigins = corsSection["AllowedOrigins"];
+            var allowedOrigins = configuration["Cors:AllowedOrigins"];
 
             services.AddCors(options =>
             {
