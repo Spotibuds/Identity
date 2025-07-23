@@ -37,7 +37,7 @@ builder.WebHost.UseUrls("http://0.0.0.0:80");
 
 var app = builder.Build();
 
-// Initialize roles with error handling
+// Apply database migrations and initialize roles with comprehensive error handling
 try
 {
     using (var scope = app.Services.CreateScope())
@@ -45,9 +45,18 @@ try
         var logger = scope.ServiceProvider.GetRequiredService<ILogger<Program>>();
         var dbContext = scope.ServiceProvider.GetRequiredService<IdentityDbContext>();
         
+        logger.LogInformation("Starting database initialization...");
+        
         // Test database connection first
         if (await dbContext.Database.CanConnectAsync())
         {
+            logger.LogInformation("Database connection successful. Applying migrations...");
+            
+            // Apply any pending migrations
+            await dbContext.Database.MigrateAsync();
+            logger.LogInformation("Database migrations applied successfully.");
+            
+            // Initialize roles
             var roleManager = scope.ServiceProvider.GetRequiredService<RoleManager<IdentityRole<Guid>>>();
 
             string[] roles = { "User", "Musician", "Admin" };
@@ -56,22 +65,41 @@ try
             {
                 if (!await roleManager.RoleExistsAsync(role))
                 {
-                    await roleManager.CreateAsync(new IdentityRole<Guid>(role));
+                    var result = await roleManager.CreateAsync(new IdentityRole<Guid>(role));
+                    if (result.Succeeded)
+                    {
+                        logger.LogInformation("Created role: {Role}", role);
+                    }
+                    else
+                    {
+                        logger.LogError("Failed to create role {Role}: {Errors}", role, string.Join(", ", result.Errors.Select(e => e.Description)));
+                    }
+                }
+                else
+                {
+                    logger.LogInformation("Role {Role} already exists", role);
                 }
             }
             logger.LogInformation("Role initialization completed successfully.");
         }
         else
         {
-            logger.LogWarning("Database connection failed. Skipping role initialization.");
+            logger.LogError("Database connection failed. Database initialization skipped.");
+            logger.LogError("Connection string: {ConnectionString}", connectionString?.Substring(0, Math.Min(50, connectionString.Length)) + "...");
         }
     }
 }
 catch (Exception ex)
 {
     var logger = app.Services.GetRequiredService<ILogger<Program>>();
-    logger.LogError(ex, "Failed to initialize roles. Application will continue without role setup.");
+    logger.LogError(ex, "Failed to initialize database and roles. Application will continue with limited functionality.");
+    logger.LogError("Exception details: {ExceptionType}: {Message}", ex.GetType().Name, ex.Message);
+    if (ex.InnerException != null)
+    {
+        logger.LogError("Inner exception: {InnerExceptionType}: {InnerMessage}", ex.InnerException.GetType().Name, ex.InnerException.Message);
+    }
 }
+
 app.UseSwagger();
 app.UseSwaggerUI();
 
@@ -81,6 +109,35 @@ app.UseAuthorization();
 app.MapControllers();
 
 app.MapGet("/", () => "Identity API is running!");
-app.MapGet("/health", () => new { status = "healthy", timestamp = DateTime.UtcNow });
+app.MapGet("/health", async (HttpContext context) => 
+{
+    var dbContext = context.RequestServices.GetRequiredService<IdentityDbContext>();
+    var logger = context.RequestServices.GetRequiredService<ILogger<Program>>();
+    
+    try
+    {
+        var canConnect = await dbContext.Database.CanConnectAsync();
+        var pendingMigrations = await dbContext.Database.GetPendingMigrationsAsync();
+        
+        return Results.Ok(new { 
+            status = canConnect ? "healthy" : "unhealthy",
+            timestamp = DateTime.UtcNow,
+            database = new {
+                connected = canConnect,
+                pendingMigrations = pendingMigrations.Count(),
+                migrations = pendingMigrations
+            }
+        });
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Health check failed");
+        return Results.Ok(new { 
+            status = "unhealthy", 
+            timestamp = DateTime.UtcNow,
+            error = ex.Message 
+        });
+    }
+});
 
 app.Run();

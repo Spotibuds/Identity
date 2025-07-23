@@ -116,6 +116,17 @@ public class AuthController : ControllerBase
         {
             _logger.LogInformation("Registration attempt for user: {Username}, Email: {Email}", dto.Username, dto.Email);
 
+            // Test database connectivity before proceeding
+            try
+            {
+                await _dbContext.Database.CanConnectAsync();
+            }
+            catch (Exception dbEx)
+            {
+                _logger.LogError(dbEx, "Database connectivity check failed during registration");
+                return StatusCode(500, new { message = "Database temporarily unavailable. Please try again later.", detail = "Database connection failed" });
+            }
+
             var existingUser = await _userManager.FindByEmailAsync(dto.Email);
             if (existingUser != null)
             {
@@ -144,9 +155,19 @@ public class AuthController : ControllerBase
             if (result.Succeeded)
             {
                 _logger.LogInformation("User {UserId} created successfully in Identity, adding to User role", user.Id);
-                await _userManager.AddToRoleAsync(user, "User");
                 
-                // Try to sync to MongoDB - log but don't fail registration if this fails
+                // Add user to role with error handling
+                try
+                {
+                    await _userManager.AddToRoleAsync(user, "User");
+                    _logger.LogInformation("User {UserId} added to User role successfully", user.Id);
+                }
+                catch (Exception roleEx)
+                {
+                    _logger.LogError(roleEx, "Failed to add user {UserId} to User role, but registration will continue", user.Id);
+                }
+                
+                // Sync to MongoDB - this is required for the system to work properly
                 try
                 {
                     _logger.LogInformation("Syncing user {UserId} to MongoDB", user.Id);
@@ -155,7 +176,20 @@ public class AuthController : ControllerBase
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Failed to sync user {UserId} to MongoDB during registration. Registration will continue.", user.Id);
+                    _logger.LogError(ex, "Failed to sync user {UserId} to MongoDB during registration", user.Id);
+                    
+                    // MongoDB sync failure is critical - we should clean up the Identity user
+                    try
+                    {
+                        await _userManager.DeleteAsync(user);
+                        _logger.LogInformation("Cleaned up Identity user {UserId} due to MongoDB sync failure", user.Id);
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        _logger.LogError(cleanupEx, "Failed to clean up Identity user {UserId} after MongoDB sync failure", user.Id);
+                    }
+                    
+                    return StatusCode(500, new { message = "User registration failed due to database synchronization error", detail = ex.Message });
                 }
 
                 _logger.LogInformation("User {UserId} registered successfully", user.Id);
@@ -170,6 +204,16 @@ public class AuthController : ControllerBase
         catch (Exception ex)
         {
             _logger.LogError(ex, "Unexpected error during user registration for {Username}: {Error}", dto.Username, ex.Message);
+            
+            // Log stack trace for debugging
+            _logger.LogError("Stack trace: {StackTrace}", ex.StackTrace);
+            
+            // Check if it's a database-related exception
+            if (ex.Message.Contains("transient") || ex.Message.Contains("connection") || ex.Message.Contains("timeout"))
+            {
+                return StatusCode(500, new { message = "Database temporarily unavailable. Please try again in a moment.", detail = "Transient database error" });
+            }
+            
             return StatusCode(500, new { message = "An error occurred during registration", detail = ex.Message });
         }
     }
