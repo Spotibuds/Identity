@@ -114,15 +114,19 @@ public class AuthController : ControllerBase
     {
         try
         {
+            _logger.LogInformation("Registration attempt for user: {Username}, Email: {Email}", dto.Username, dto.Email);
+
             var existingUser = await _userManager.FindByEmailAsync(dto.Email);
             if (existingUser != null)
             {
+                _logger.LogWarning("Registration failed: Email {Email} already exists", dto.Email);
                 return BadRequest(new { message = "User with this email already exists" });
             }
 
             existingUser = await _userManager.FindByNameAsync(dto.Username);
             if (existingUser != null)
             {
+                _logger.LogWarning("Registration failed: Username {Username} already taken", dto.Username);
                 return BadRequest(new { message = "Username is already taken" });
             }
 
@@ -134,30 +138,39 @@ public class AuthController : ControllerBase
                 CreatedAt = DateTime.UtcNow
             };
 
+            _logger.LogInformation("Creating user {Username} with Identity", dto.Username);
             var result = await _userManager.CreateAsync(user, dto.Password);
 
             if (result.Succeeded)
             {
+                _logger.LogInformation("User {UserId} created successfully in Identity, adding to User role", user.Id);
                 await _userManager.AddToRoleAsync(user, "User");
+                
+                // Try to sync to MongoDB - log but don't fail registration if this fails
                 try
                 {
+                    _logger.LogInformation("Syncing user {UserId} to MongoDB", user.Id);
                     await _userSyncService.SyncUserToMongoDbAsync(user);
+                    _logger.LogInformation("User {UserId} synced to MongoDB successfully", user.Id);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Failed to sync user {UserId} to MongoDB during registration", user.Id);
+                    _logger.LogError(ex, "Failed to sync user {UserId} to MongoDB during registration. Registration will continue.", user.Id);
                 }
 
                 _logger.LogInformation("User {UserId} registered successfully", user.Id);
                 return Ok(new { message = "User registered successfully", userId = user.Id });
             }
 
-            return BadRequest(new { message = "Registration failed", errors = result.Errors.Select(e => e.Description) });
+            // Log specific validation errors
+            var errors = result.Errors.Select(e => e.Description).ToList();
+            _logger.LogWarning("User registration failed for {Username}: {Errors}", dto.Username, string.Join(", ", errors));
+            return BadRequest(new { message = "Registration failed", errors = errors });
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error during user registration");
-            return StatusCode(500, new { message = "An error occurred during registration" });
+            _logger.LogError(ex, "Unexpected error during user registration for {Username}: {Error}", dto.Username, ex.Message);
+            return StatusCode(500, new { message = "An error occurred during registration", detail = ex.Message });
         }
     }
 
