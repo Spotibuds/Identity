@@ -10,8 +10,17 @@ builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
+// Get connection string from configuration or environment variable
+var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")
+    ?? Environment.GetEnvironmentVariable("ConnectionStrings__DefaultConnection");
+
+if (string.IsNullOrEmpty(connectionString))
+{
+    throw new InvalidOperationException("Database connection string not found. Please set ConnectionStrings__DefaultConnection environment variable.");
+}
+
 builder.Services.AddDbContext<IdentityDbContext>(options =>
-    options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection")));
+    options.UseNpgsql(connectionString));
 
 builder.Services.AddIdentityServices(builder.Configuration);
 
@@ -28,21 +37,41 @@ builder.WebHost.UseUrls("http://0.0.0.0:80");
 
 var app = builder.Build();
 
-using (var scope = app.Services.CreateScope())
+// Initialize roles with error handling
+try
 {
-    var roleManager = scope.ServiceProvider.GetRequiredService<RoleManager<IdentityRole<Guid>>>();
-
-    string[] roles = { "User", "Musician", "Admin" };
-
-    foreach (var role in roles)
+    using (var scope = app.Services.CreateScope())
     {
-        if (!await roleManager.RoleExistsAsync(role))
+        var logger = scope.ServiceProvider.GetRequiredService<ILogger<Program>>();
+        var dbContext = scope.ServiceProvider.GetRequiredService<IdentityDbContext>();
+        
+        // Test database connection first
+        if (await dbContext.Database.CanConnectAsync())
         {
-            await roleManager.CreateAsync(new IdentityRole<Guid>(role));
+            var roleManager = scope.ServiceProvider.GetRequiredService<RoleManager<IdentityRole<Guid>>>();
+
+            string[] roles = { "User", "Musician", "Admin" };
+
+            foreach (var role in roles)
+            {
+                if (!await roleManager.RoleExistsAsync(role))
+                {
+                    await roleManager.CreateAsync(new IdentityRole<Guid>(role));
+                }
+            }
+            logger.LogInformation("Role initialization completed successfully.");
+        }
+        else
+        {
+            logger.LogWarning("Database connection failed. Skipping role initialization.");
         }
     }
 }
-
+catch (Exception ex)
+{
+    var logger = app.Services.GetRequiredService<ILogger<Program>>();
+    logger.LogError(ex, "Failed to initialize roles. Application will continue without role setup.");
+}
 app.UseSwagger();
 app.UseSwaggerUI();
 
