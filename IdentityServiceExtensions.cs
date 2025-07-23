@@ -60,17 +60,16 @@ namespace Identity
 
         public static IServiceCollection AddSpotibudsCors(this IServiceCollection services, IConfiguration configuration)
         {
-            var allowedOrigins = configuration["Cors:AllowedOrigins"];
-
             services.AddCors(options =>
             {
                 options.AddPolicy("SpotibudsPolicy", policy =>
-                {
-                    policy.AllowAnyOrigin()
-                        .AllowAnyHeader()
-                        .AllowAnyMethod();
-                });
+                    {
+                        policy.AllowAnyOrigin()
+                            .AllowAnyHeader()
+                            .AllowAnyMethod();
+                    });
             });
+
             return services;
         }
     }
