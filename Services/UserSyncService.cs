@@ -16,7 +16,13 @@ public class UserSyncService : IUserSyncService
     {
         _httpClient = httpClient;
         _logger = logger;
+        
         var mongoConnectionString = configuration.GetConnectionString("MongoDb");
+        if (string.IsNullOrEmpty(mongoConnectionString))
+        {
+            throw new InvalidOperationException("MongoDB connection string not found. Please set ConnectionStrings__MongoDb environment variable.");
+        }
+        
         var mongoClient = new MongoClient(mongoConnectionString);
         var mongoDatabase = mongoClient.GetDatabase("spotibuds");
         _usersCollection = mongoDatabase.GetCollection<BsonDocument>("users");

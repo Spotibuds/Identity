@@ -64,9 +64,26 @@ namespace Identity
             {
                 options.AddPolicy("SpotibudsPolicy", policy =>
                     {
-                        policy.AllowAnyOrigin()
-                            .AllowAnyHeader()
-                            .AllowAnyMethod();
+                        var allowedOrigins = configuration["Cors:AllowedOrigins"];
+                        if (!string.IsNullOrEmpty(allowedOrigins))
+                        {
+                            if (allowedOrigins == "*")
+                            {
+                                policy.AllowAnyOrigin();
+                            }
+                            else
+                            {
+                                var origins = allowedOrigins.Split(',', StringSplitOptions.RemoveEmptyEntries);
+                                policy.WithOrigins(origins);
+                            }
+                        }
+                        else
+                        {
+                            policy.AllowAnyOrigin();
+                        }
+                        
+                        policy.AllowAnyHeader()
+                              .AllowAnyMethod();
                     });
             });
 
