@@ -629,6 +629,46 @@ public class AuthController : ControllerBase
             return StatusCode(500, new { message = "An error occurred during search" });
         }
     }
+
+    [HttpGet("test-connection")]
+    public async Task<IActionResult> TestDatabaseConnection()
+    {
+        try
+        {
+            var connectionString = _configuration.GetConnectionString("DefaultConnection");
+            _logger.LogInformation("Testing connection with: {ConnectionString}", connectionString?.Substring(0, Math.Min(50, connectionString?.Length ?? 0)) + "...");
+            
+            // Test database context
+            var canConnect = await _dbContext.Database.CanConnectAsync();
+            
+            // Test MongoDB connection
+            var mongoConnectionString = _configuration.GetConnectionString("MongoDb");
+            
+            return Ok(new
+            {
+                timestamp = DateTime.UtcNow,
+                postgresql = new
+                {
+                    connectionString = connectionString?.Substring(0, Math.Min(50, connectionString?.Length ?? 0)) + "...",
+                    entityFrameworkConnection = canConnect
+                },
+                mongodb = new
+                {
+                    connectionString = mongoConnectionString?.Substring(0, Math.Min(50, mongoConnectionString?.Length ?? 0)) + "...",
+                    configured = !string.IsNullOrEmpty(mongoConnectionString)
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error testing connections");
+            return StatusCode(500, new { 
+                message = "Connection test failed", 
+                error = ex.Message,
+                stackTrace = ex.StackTrace?.Substring(0, Math.Min(500, ex.StackTrace?.Length ?? 0))
+            });
+        }
+    }
 }
 
 public class RegisterDto
