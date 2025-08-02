@@ -13,6 +13,7 @@ using System.Security.Cryptography;
 using Microsoft.EntityFrameworkCore;
 using MongoDB.Bson;
 using MongoDB.Driver;
+using System.Text.Json.Serialization;
 
 namespace Identity.Controllers;
 
@@ -669,6 +670,29 @@ public class AuthController : ControllerBase
             });
         }
     }
+
+    [HttpGet("users")]
+    public async Task<IActionResult> GetAllUsers()
+    {
+        try
+        {
+            var users = await _userManager.Users.Select(u => new
+            {
+                Id = u.Id.ToString(),
+                UserName = u.UserName,
+                Email = u.Email,
+                IsPrivate = u.IsPrivate,
+                CreatedAt = u.CreatedAt
+            }).ToListAsync();
+
+            return Ok(users);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting all users");
+            return StatusCode(500, "Internal server error");
+        }
+    }
 }
 
 public class RegisterDto
@@ -685,6 +709,9 @@ public class RegisterDto
     [Required]
     [StringLength(100, MinimumLength = 8)]
     public string Password { get; set; } = string.Empty;
+
+    [JsonPropertyName("name")]
+    public string? Name { get; set; }
 
     public bool? IsPrivate { get; set; }
 }

@@ -10,8 +10,8 @@ public class UserSyncService : IUserSyncService
 {
     private readonly HttpClient _httpClient;
     private readonly ILogger<UserSyncService> _logger;
-    private readonly IMongoCollection<BsonDocument> _usersCollection;
-    private readonly string _connectionString;
+    private readonly IMongoCollection<BsonDocument>? _usersCollection;
+    private readonly string? _connectionString;
 
     public UserSyncService(HttpClient httpClient, ILogger<UserSyncService> logger, IConfiguration configuration)
     {
@@ -21,7 +21,10 @@ public class UserSyncService : IUserSyncService
         var mongoConnectionString = configuration.GetConnectionString("MongoDb");
         if (string.IsNullOrEmpty(mongoConnectionString))
         {
-            throw new InvalidOperationException("MongoDB connection string not found. Please set ConnectionStrings__MongoDb environment variable.");
+            _logger.LogWarning("MongoDB connection string not found. User synchronization will be disabled.");
+            _connectionString = null;
+            _usersCollection = null;
+            return;
         }
         
         // Fix the connection string - remove authMechanism=DEFAULT which can cause issues
@@ -39,13 +42,19 @@ public class UserSyncService : IUserSyncService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to initialize MongoDB client. This is required for user synchronization.");
-            throw new InvalidOperationException($"MongoDB client initialization failed: {ex.Message}", ex);
+            _logger.LogError(ex, "Failed to initialize MongoDB client. User synchronization will be disabled.");
+            _connectionString = null;
+            _usersCollection = null;
         }
     }
 
     private async Task<bool> TestConnectionAsync()
     {
+        if (_connectionString == null)
+        {
+            return false;
+        }
+
         try
         {
             _logger.LogInformation("Testing MongoDB connection...");
@@ -66,6 +75,12 @@ public class UserSyncService : IUserSyncService
 
     public async Task SyncUserToMongoDbAsync(User identityUser)
     {
+        if (_usersCollection == null || _connectionString == null)
+        {
+            _logger.LogWarning("MongoDB not configured. Skipping user sync for user {UserId}", identityUser.Id);
+            return;
+        }
+
         try
         {
             _logger.LogInformation("Starting MongoDB sync for user {UserId}", identityUser.Id);
@@ -80,9 +95,15 @@ public class UserSyncService : IUserSyncService
             {
                 { "IdentityUserId", identityUser.Id.ToString() },
                 { "UserName", identityUser.UserName ?? string.Empty },
-                { "Email", identityUser.Email ?? string.Empty },
+                { "DisplayName", string.Empty },
+                { "Bio", string.Empty },
+                { "AvatarUrl", BsonNull.Value },
                 { "IsPrivate", identityUser.IsPrivate },
-                { "CreatedAt", identityUser.CreatedAt }
+                { "Playlists", new BsonArray() },
+                { "FollowedUsers", new BsonArray() },
+                { "Followers", new BsonArray() },
+                { "CreatedAt", identityUser.CreatedAt },
+                { "UpdatedAt", BsonNull.Value }
             };
             
             await _usersCollection.InsertOneAsync(userDoc);
@@ -97,6 +118,12 @@ public class UserSyncService : IUserSyncService
 
     public async Task UpdateUserInMongoDbAsync(User identityUser)
     {
+        if (_usersCollection == null || _connectionString == null)
+        {
+            _logger.LogWarning("MongoDB not configured. Skipping user update for user {UserId}", identityUser.Id);
+            return;
+        }
+
         try
         {
             _logger.LogInformation("Starting MongoDB update for user {UserId}", identityUser.Id);
@@ -104,7 +131,6 @@ public class UserSyncService : IUserSyncService
             var filter = Builders<BsonDocument>.Filter.Eq("IdentityUserId", identityUser.Id.ToString());
             var update = Builders<BsonDocument>.Update
                 .Set("UserName", identityUser.UserName ?? string.Empty)
-                .Set("Email", identityUser.Email ?? string.Empty)
                 .Set("IsPrivate", identityUser.IsPrivate)
                 .Set("UpdatedAt", DateTime.UtcNow);
                 
@@ -128,6 +154,12 @@ public class UserSyncService : IUserSyncService
 
     public async Task DeleteUserFromMongoDbAsync(string identityUserId)
     {
+        if (_usersCollection == null || _connectionString == null)
+        {
+            _logger.LogWarning("MongoDB not configured. Skipping user deletion for user {UserId}", identityUserId);
+            return;
+        }
+
         try
         {
             _logger.LogInformation("Starting MongoDB deletion for user {UserId}", identityUserId);

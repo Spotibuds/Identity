@@ -33,7 +33,7 @@ builder.Services.AddScoped<IUserSyncService, UserSyncService>();
 
 //listen port 80
 
-builder.WebHost.UseUrls("http://0.0.0.0:80");
+builder.WebHost.UseUrls("http://0.0.0.0:5000");
 
 var app = builder.Build();
 
