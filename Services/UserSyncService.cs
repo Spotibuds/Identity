@@ -34,11 +34,16 @@ public class UserSyncService : IUserSyncService
         
         try
         {
-            var mongoClient = new MongoClient(_connectionString);
+            var mongoClientSettings = MongoClientSettings.FromConnectionString(_connectionString);
+            mongoClientSettings.ServerSelectionTimeout = TimeSpan.FromSeconds(5); // Reduced from 10 to 5
+            mongoClientSettings.ConnectTimeout = TimeSpan.FromSeconds(5); // Reduced from 10 to 5
+            mongoClientSettings.SocketTimeout = TimeSpan.FromSeconds(5); // Reduced from 10 to 5
+            
+            var mongoClient = new MongoClient(mongoClientSettings);
             var mongoDatabase = mongoClient.GetDatabase("spotibuds");
             _usersCollection = mongoDatabase.GetCollection<BsonDocument>("users");
             
-            _logger.LogInformation("MongoDB client initialized successfully. Connection will be tested on first use.");
+            _logger.LogInformation("MongoDB client initialized successfully with optimized settings. Connection will be tested on first use.");
         }
         catch (Exception ex)
         {
@@ -48,7 +53,7 @@ public class UserSyncService : IUserSyncService
         }
     }
 
-    private async Task<bool> TestConnectionAsync()
+    private async Task<bool> TestConnectionAsync(CancellationToken cancellationToken = default)
     {
         if (_connectionString == null)
         {
@@ -58,11 +63,16 @@ public class UserSyncService : IUserSyncService
         try
         {
             _logger.LogInformation("Testing MongoDB connection...");
-            var mongoClient = new MongoClient(_connectionString);
+            var mongoClientSettings = MongoClientSettings.FromConnectionString(_connectionString);
+            mongoClientSettings.ServerSelectionTimeout = TimeSpan.FromSeconds(5); // Reduced from 10 to 5
+            mongoClientSettings.ConnectTimeout = TimeSpan.FromSeconds(5); // Reduced from 10 to 5
+            mongoClientSettings.SocketTimeout = TimeSpan.FromSeconds(5); // Reduced from 10 to 5
+            
+            var mongoClient = new MongoClient(mongoClientSettings);
             var mongoDatabase = mongoClient.GetDatabase("spotibuds");
             
-            // Use a simpler ping command
-            var result = await mongoDatabase.RunCommandAsync<BsonDocument>(new BsonDocument("ping", 1));
+            // Use a simpler ping command with timeout
+            var result = await mongoDatabase.RunCommandAsync<BsonDocument>(new BsonDocument("ping", 1), cancellationToken: cancellationToken);
             _logger.LogInformation("MongoDB connection test successful: {Result}", result.ToJson());
             return true;
         }
@@ -73,7 +83,7 @@ public class UserSyncService : IUserSyncService
         }
     }
 
-    public async Task SyncUserToMongoDbAsync(User identityUser)
+    public async Task SyncUserToMongoDbAsync(User identityUser, CancellationToken cancellationToken = default)
     {
         if (_usersCollection == null || _connectionString == null)
         {
@@ -81,38 +91,74 @@ public class UserSyncService : IUserSyncService
             return;
         }
 
-        try
+        const int maxRetries = 1; // Reduced from 2 to 1 for faster failure
+        var retryCount = 0;
+        var syncStartTime = DateTime.UtcNow;
+
+        while (retryCount <= maxRetries)
         {
-            _logger.LogInformation("Starting MongoDB sync for user {UserId}", identityUser.Id);
-            
-            // Test connection before first use
-            if (!await TestConnectionAsync())
+            try
             {
-                throw new InvalidOperationException("MongoDB connection test failed before user sync");
+                _logger.LogInformation("Starting MongoDB sync for user {UserId} (attempt {RetryCount}/{MaxRetries})", identityUser.Id, retryCount + 1, maxRetries + 1);
+                
+                // Skip connection test on retry to save time
+                if (retryCount == 0 && !await TestConnectionAsync(cancellationToken))
+                {
+                    throw new InvalidOperationException("MongoDB connection test failed before user sync");
+                }
+                
+                var userDoc = new BsonDocument
+                {
+                    { "IdentityUserId", identityUser.Id.ToString() },
+                    { "UserName", identityUser.UserName ?? string.Empty },
+                    { "DisplayName", string.Empty },
+                    { "Bio", string.Empty },
+                    { "AvatarUrl", BsonNull.Value },
+                    { "IsPrivate", identityUser.IsPrivate },
+                    { "Playlists", new BsonArray() },
+                    { "FollowedUsers", new BsonArray() },
+                    { "Followers", new BsonArray() },
+                    { "CreatedAt", identityUser.CreatedAt },
+                    { "UpdatedAt", BsonNull.Value }
+                };
+                
+                await _usersCollection.InsertOneAsync(userDoc, cancellationToken: cancellationToken);
+                var syncTime = DateTime.UtcNow - syncStartTime;
+                _logger.LogInformation("Successfully synced user {UserId} to MongoDB in {SyncTime}ms", identityUser.Id, syncTime.TotalMilliseconds);
+                return; // Success, exit the retry loop
             }
-            
-            var userDoc = new BsonDocument
+            catch (OperationCanceledException)
             {
-                { "IdentityUserId", identityUser.Id.ToString() },
-                { "UserName", identityUser.UserName ?? string.Empty },
-                { "DisplayName", string.Empty },
-                { "Bio", string.Empty },
-                { "AvatarUrl", BsonNull.Value },
-                { "IsPrivate", identityUser.IsPrivate },
-                { "Playlists", new BsonArray() },
-                { "FollowedUsers", new BsonArray() },
-                { "Followers", new BsonArray() },
-                { "CreatedAt", identityUser.CreatedAt },
-                { "UpdatedAt", BsonNull.Value }
-            };
-            
-            await _usersCollection.InsertOneAsync(userDoc);
-            _logger.LogInformation("Successfully synced user {UserId} to MongoDB", identityUser.Id);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to sync user {UserId} to MongoDB", identityUser.Id);
-            throw; // Re-throw the exception so registration can handle it appropriately
+                var syncTime = DateTime.UtcNow - syncStartTime;
+                _logger.LogWarning("MongoDB sync operation was cancelled for user {UserId} after {SyncTime}ms", identityUser.Id, syncTime.TotalMilliseconds);
+                throw; // Don't retry on cancellation
+            }
+            catch (Exception ex)
+            {
+                retryCount++;
+                var syncTime = DateTime.UtcNow - syncStartTime;
+                _logger.LogError(ex, "Failed to sync user {UserId} to MongoDB (attempt {RetryCount}/{MaxRetries}) after {SyncTime}ms", identityUser.Id, retryCount, maxRetries + 1, syncTime.TotalMilliseconds);
+                
+                if (retryCount > maxRetries)
+                {
+                    _logger.LogError("Max retries reached for MongoDB sync of user {UserId} after {SyncTime}ms", identityUser.Id, syncTime.TotalMilliseconds);
+                    throw; // Re-throw the exception after max retries
+                }
+                
+                // Reduced delay for faster retry
+                var delay = TimeSpan.FromSeconds(1); // Fixed 1 second delay instead of exponential backoff
+                _logger.LogInformation("Retrying MongoDB sync for user {UserId} in {Delay}ms", identityUser.Id, delay.TotalMilliseconds);
+                
+                try
+                {
+                    await Task.Delay(delay, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    _logger.LogWarning("Retry delay was cancelled for user {UserId}", identityUser.Id);
+                    throw; // Don't retry if cancellation was requested during delay
+                }
+            }
         }
     }
 

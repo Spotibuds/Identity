@@ -113,18 +113,23 @@ public class AuthController : ControllerBase
     [HttpPost("register")]
     public async Task<IActionResult> Register([FromBody] RegisterDto dto)
     {
+        var startTime = DateTime.UtcNow;
         try
         {
             _logger.LogInformation("Registration attempt for user: {Username}, Email: {Email}", dto.Username, dto.Email);
 
             // Test database connectivity before proceeding
+            var dbCheckStart = DateTime.UtcNow;
             try
             {
                 await _dbContext.Database.CanConnectAsync();
+                var dbCheckTime = DateTime.UtcNow - dbCheckStart;
+                _logger.LogInformation("Database connectivity check completed in {DbCheckTime}ms", dbCheckTime.TotalMilliseconds);
             }
             catch (Exception dbEx)
             {
-                _logger.LogError(dbEx, "Database connectivity check failed during registration");
+                var dbCheckTime = DateTime.UtcNow - dbCheckStart;
+                _logger.LogError(dbEx, "Database connectivity check failed during registration after {DbCheckTime}ms", dbCheckTime.TotalMilliseconds);
                 return StatusCode(500, new { message = "Database temporarily unavailable. Please try again later.", detail = "Database connection failed" });
             }
 
@@ -150,34 +155,64 @@ public class AuthController : ControllerBase
                 CreatedAt = DateTime.UtcNow
             };
 
+            var userCreateStart = DateTime.UtcNow;
             _logger.LogInformation("Creating user {Username} with Identity", dto.Username);
             var result = await _userManager.CreateAsync(user, dto.Password);
+            var userCreateTime = DateTime.UtcNow - userCreateStart;
+            _logger.LogInformation("User creation completed in {UserCreateTime}ms", userCreateTime.TotalMilliseconds);
 
             if (result.Succeeded)
             {
                 _logger.LogInformation("User {UserId} created successfully in Identity, adding to User role", user.Id);
                 
                 // Add user to role with error handling
+                var roleAddStart = DateTime.UtcNow;
                 try
                 {
                     await _userManager.AddToRoleAsync(user, "User");
-                    _logger.LogInformation("User {UserId} added to User role successfully", user.Id);
+                    var roleAddTime = DateTime.UtcNow - roleAddStart;
+                    _logger.LogInformation("User {UserId} added to User role successfully in {RoleAddTime}ms", user.Id, roleAddTime.TotalMilliseconds);
                 }
                 catch (Exception roleEx)
                 {
-                    _logger.LogError(roleEx, "Failed to add user {UserId} to User role, but registration will continue", user.Id);
+                    var roleAddTime = DateTime.UtcNow - roleAddStart;
+                    _logger.LogError(roleEx, "Failed to add user {UserId} to User role after {RoleAddTime}ms, but registration will continue", user.Id, roleAddTime.TotalMilliseconds);
                 }
                 
                 // Sync to MongoDB - this is required for the system to work properly
+                var mongoSyncStart = DateTime.UtcNow;
                 try
                 {
                     _logger.LogInformation("Syncing user {UserId} to MongoDB", user.Id);
-                    await _userSyncService.SyncUserToMongoDbAsync(user);
-                    _logger.LogInformation("User {UserId} synced to MongoDB successfully", user.Id);
+                    
+                    // Add timeout for MongoDB sync operation
+                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15)); // Reduced from 20 to 15 seconds
+                    await _userSyncService.SyncUserToMongoDbAsync(user, cts.Token);
+                    var mongoSyncTime = DateTime.UtcNow - mongoSyncStart;
+                    _logger.LogInformation("User {UserId} synced to MongoDB successfully in {MongoSyncTime}ms", user.Id, mongoSyncTime.TotalMilliseconds);
+                }
+                catch (OperationCanceledException)
+                {
+                    var mongoSyncTime = DateTime.UtcNow - mongoSyncStart;
+                    _logger.LogError("MongoDB sync timeout for user {UserId} during registration after {MongoSyncTime}ms", user.Id, mongoSyncTime.TotalMilliseconds);
+                    
+                    // MongoDB sync timeout - clean up the Identity user
+                    try
+                    {
+                        await _userManager.DeleteAsync(user);
+                        _logger.LogInformation("Cleaned up Identity user {UserId} due to MongoDB sync timeout", user.Id);
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        _logger.LogError(cleanupEx, "Failed to clean up Identity user {UserId} after MongoDB sync timeout", user.Id);
+                    }
+                    
+                    return StatusCode(500, new { message = "User registration failed due to database synchronization timeout. Please try again.", detail = "MongoDB sync operation timed out" });
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Failed to sync user {UserId} to MongoDB during registration", user.Id);
+                    var mongoSyncTime = DateTime.UtcNow - mongoSyncStart;
+                    _logger.LogError(ex, "Failed to sync user {UserId} to MongoDB during registration after {MongoSyncTime}ms", user.Id, mongoSyncTime.TotalMilliseconds);
                     
                     // MongoDB sync failure is critical - we should clean up the Identity user
                     try
@@ -193,7 +228,8 @@ public class AuthController : ControllerBase
                     return StatusCode(500, new { message = "User registration failed due to database synchronization error", detail = ex.Message });
                 }
 
-                _logger.LogInformation("User {UserId} registered successfully", user.Id);
+                var totalTime = DateTime.UtcNow - startTime;
+                _logger.LogInformation("User {UserId} registered successfully in {TotalTime}ms", user.Id, totalTime.TotalMilliseconds);
                 return Ok(new { message = "User registered successfully", userId = user.Id });
             }
 
