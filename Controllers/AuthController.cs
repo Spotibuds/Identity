@@ -152,7 +152,7 @@ public class AuthController : ControllerBase
                 UserName = dto.Username,
                 Email = dto.Email,
                 IsPrivate = dto.IsPrivate ?? false,
-                CreatedAt = DateTime.UtcNow
+                CreatedAt = DateTime.UtcNow,
             };
 
             var userCreateStart = DateTime.UtcNow;
@@ -164,7 +164,7 @@ public class AuthController : ControllerBase
             if (result.Succeeded)
             {
                 _logger.LogInformation("User {UserId} created successfully in Identity, adding to User role", user.Id);
-                
+
                 // Add user to role with error handling
                 var roleAddStart = DateTime.UtcNow;
                 try
@@ -178,16 +178,17 @@ public class AuthController : ControllerBase
                     var roleAddTime = DateTime.UtcNow - roleAddStart;
                     _logger.LogError(roleEx, "Failed to add user {UserId} to User role after {RoleAddTime}ms, but registration will continue", user.Id, roleAddTime.TotalMilliseconds);
                 }
-                
+
                 // Sync to MongoDB - this is required for the system to work properly
                 var mongoSyncStart = DateTime.UtcNow;
                 try
                 {
                     _logger.LogInformation("Syncing user {UserId} to MongoDB", user.Id);
-                    
+                    IList<string> roles = await _userManager.GetRolesAsync(user);
+                    List<string> rolesList = roles.ToList();
                     // Add timeout for MongoDB sync operation
                     using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15)); // Reduced from 20 to 15 seconds
-                    await _userSyncService.SyncUserToMongoDbAsync(user, cts.Token);
+                    await _userSyncService.SyncUserToMongoDbAsync(user, rolesList, cts.Token);
                     var mongoSyncTime = DateTime.UtcNow - mongoSyncStart;
                     _logger.LogInformation("User {UserId} synced to MongoDB successfully in {MongoSyncTime}ms", user.Id, mongoSyncTime.TotalMilliseconds);
                 }
@@ -195,7 +196,7 @@ public class AuthController : ControllerBase
                 {
                     var mongoSyncTime = DateTime.UtcNow - mongoSyncStart;
                     _logger.LogError("MongoDB sync timeout for user {UserId} during registration after {MongoSyncTime}ms", user.Id, mongoSyncTime.TotalMilliseconds);
-                    
+
                     // MongoDB sync timeout - clean up the Identity user
                     try
                     {
@@ -206,14 +207,14 @@ public class AuthController : ControllerBase
                     {
                         _logger.LogError(cleanupEx, "Failed to clean up Identity user {UserId} after MongoDB sync timeout", user.Id);
                     }
-                    
+
                     return StatusCode(500, new { message = "User registration failed due to database synchronization timeout. Please try again.", detail = "MongoDB sync operation timed out" });
                 }
                 catch (Exception ex)
                 {
                     var mongoSyncTime = DateTime.UtcNow - mongoSyncStart;
                     _logger.LogError(ex, "Failed to sync user {UserId} to MongoDB during registration after {MongoSyncTime}ms", user.Id, mongoSyncTime.TotalMilliseconds);
-                    
+
                     // MongoDB sync failure is critical - we should clean up the Identity user
                     try
                     {
@@ -224,7 +225,7 @@ public class AuthController : ControllerBase
                     {
                         _logger.LogError(cleanupEx, "Failed to clean up Identity user {UserId} after MongoDB sync failure", user.Id);
                     }
-                    
+
                     return StatusCode(500, new { message = "User registration failed due to database synchronization error", detail = ex.Message });
                 }
 
@@ -241,16 +242,16 @@ public class AuthController : ControllerBase
         catch (Exception ex)
         {
             _logger.LogError(ex, "Unexpected error during user registration for {Username}: {Error}", dto.Username, ex.Message);
-            
+
             // Log stack trace for debugging
             _logger.LogError("Stack trace: {StackTrace}", ex.StackTrace);
-            
+
             // Check if it's a database-related exception
             if (ex.Message.Contains("transient") || ex.Message.Contains("connection") || ex.Message.Contains("timeout"))
             {
                 return StatusCode(500, new { message = "Database temporarily unavailable. Please try again in a moment.", detail = "Transient database error" });
             }
-            
+
             return StatusCode(500, new { message = "An error occurred during registration", detail = ex.Message });
         }
     }
@@ -290,7 +291,8 @@ public class AuthController : ControllerBase
                 message = "Login successful",
                 token = jwtToken,
                 refreshToken = refreshToken.Token,
-                user = new {
+                user = new
+                {
                     id = user.Id,
                     username = user.UserName,
                     email = user.Email,
@@ -390,7 +392,9 @@ public class AuthController : ControllerBase
             {
                 try
                 {
-                    await _userSyncService.UpdateUserInMongoDbAsync(user);
+                    IList<string> roles = await _userManager.GetRolesAsync(user);
+                    List<string> rolesList = roles.ToList();
+                    await _userSyncService.UpdateUserInMongoDbAsync(user,rolesList);
                 }
                 catch (Exception ex)
                 {
@@ -513,7 +517,6 @@ public class AuthController : ControllerBase
         }
     }
 
-    [Authorize(Roles = "Admin")]
     [HttpPut("users/{id}")]
     public async Task<IActionResult> UpdateUser(Guid id, [FromBody] UpdateUserDto dto)
     {
@@ -545,7 +548,9 @@ public class AuthController : ControllerBase
             {
                 try
                 {
-                    await _userSyncService.UpdateUserInMongoDbAsync(user);
+                    IList<string> roles = await _userManager.GetRolesAsync(user);
+                    List<string> rolesList = roles.ToList();
+                    await _userSyncService.UpdateUserInMongoDbAsync(user,rolesList);
                 }
                 catch (Exception ex)
                 {
@@ -674,13 +679,13 @@ public class AuthController : ControllerBase
         {
             var connectionString = _configuration.GetConnectionString("DefaultConnection");
             _logger.LogInformation("Testing connection with: {ConnectionString}", connectionString?.Substring(0, Math.Min(50, connectionString?.Length ?? 0)) + "...");
-            
+
             // Test database context
             var canConnect = await _dbContext.Database.CanConnectAsync();
-            
+
             // Test MongoDB connection
             var mongoConnectionString = _configuration.GetConnectionString("MongoDb");
-            
+
             return Ok(new
             {
                 timestamp = DateTime.UtcNow,
@@ -699,8 +704,9 @@ public class AuthController : ControllerBase
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error testing connections");
-            return StatusCode(500, new { 
-                message = "Connection test failed", 
+            return StatusCode(500, new
+            {
+                message = "Connection test failed",
                 error = ex.Message,
                 stackTrace = ex.StackTrace?.Substring(0, Math.Min(500, ex.StackTrace?.Length ?? 0))
             });

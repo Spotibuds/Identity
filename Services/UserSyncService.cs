@@ -1,6 +1,4 @@
 using Identity.Entities;
-using System.Text;
-using System.Text.Json;
 using MongoDB.Bson;
 using MongoDB.Driver;
 
@@ -17,7 +15,7 @@ public class UserSyncService : IUserSyncService
     {
         _httpClient = httpClient;
         _logger = logger;
-        
+
         var mongoConnectionString = configuration.GetConnectionString("MongoDb");
         if (string.IsNullOrEmpty(mongoConnectionString))
         {
@@ -26,23 +24,23 @@ public class UserSyncService : IUserSyncService
             _usersCollection = null;
             return;
         }
-        
+
         // Fix the connection string - remove authMechanism=DEFAULT which can cause issues
         _connectionString = mongoConnectionString.Replace("&authMechanism=DEFAULT", "").Replace("?authMechanism=DEFAULT&", "?").Replace("?authMechanism=DEFAULT", "");
-        
+
         _logger.LogInformation("Initializing MongoDB connection...");
-        
+
         try
         {
             var mongoClientSettings = MongoClientSettings.FromConnectionString(_connectionString);
             mongoClientSettings.ServerSelectionTimeout = TimeSpan.FromSeconds(5); // Reduced from 10 to 5
             mongoClientSettings.ConnectTimeout = TimeSpan.FromSeconds(5); // Reduced from 10 to 5
             mongoClientSettings.SocketTimeout = TimeSpan.FromSeconds(5); // Reduced from 10 to 5
-            
+
             var mongoClient = new MongoClient(mongoClientSettings);
             var mongoDatabase = mongoClient.GetDatabase("spotibuds");
             _usersCollection = mongoDatabase.GetCollection<BsonDocument>("users");
-            
+
             _logger.LogInformation("MongoDB client initialized successfully with optimized settings. Connection will be tested on first use.");
         }
         catch (Exception ex)
@@ -67,10 +65,10 @@ public class UserSyncService : IUserSyncService
             mongoClientSettings.ServerSelectionTimeout = TimeSpan.FromSeconds(5); // Reduced from 10 to 5
             mongoClientSettings.ConnectTimeout = TimeSpan.FromSeconds(5); // Reduced from 10 to 5
             mongoClientSettings.SocketTimeout = TimeSpan.FromSeconds(5); // Reduced from 10 to 5
-            
+
             var mongoClient = new MongoClient(mongoClientSettings);
             var mongoDatabase = mongoClient.GetDatabase("spotibuds");
-            
+
             // Use a simpler ping command with timeout
             var result = await mongoDatabase.RunCommandAsync<BsonDocument>(new BsonDocument("ping", 1), cancellationToken: cancellationToken);
             _logger.LogInformation("MongoDB connection test successful: {Result}", result.ToJson());
@@ -83,7 +81,7 @@ public class UserSyncService : IUserSyncService
         }
     }
 
-    public async Task SyncUserToMongoDbAsync(User identityUser, CancellationToken cancellationToken = default)
+    public async Task SyncUserToMongoDbAsync(User identityUser,List<string> roles, CancellationToken cancellationToken = default)
     {
         if (_usersCollection == null || _connectionString == null)
         {
@@ -100,19 +98,20 @@ public class UserSyncService : IUserSyncService
             try
             {
                 _logger.LogInformation("Starting MongoDB sync for user {UserId} (attempt {RetryCount}/{MaxRetries})", identityUser.Id, retryCount + 1, maxRetries + 1);
-                
+
                 // Skip connection test on retry to save time
                 if (retryCount == 0 && !await TestConnectionAsync(cancellationToken))
                 {
                     throw new InvalidOperationException("MongoDB connection test failed before user sync");
                 }
-                
+
                 var userDoc = new BsonDocument
                 {
                     { "IdentityUserId", identityUser.Id.ToString() },
                     { "UserName", identityUser.UserName ?? string.Empty },
                     { "DisplayName", string.Empty },
                     { "Bio", string.Empty },
+                    {"Roles", new BsonArray(roles ?? new List<string>()) },
                     { "AvatarUrl", BsonNull.Value },
                     { "IsPrivate", identityUser.IsPrivate },
                     { "Playlists", new BsonArray() },
@@ -121,7 +120,7 @@ public class UserSyncService : IUserSyncService
                     { "CreatedAt", identityUser.CreatedAt },
                     { "UpdatedAt", BsonNull.Value }
                 };
-                
+
                 await _usersCollection.InsertOneAsync(userDoc, cancellationToken: cancellationToken);
                 var syncTime = DateTime.UtcNow - syncStartTime;
                 _logger.LogInformation("Successfully synced user {UserId} to MongoDB in {SyncTime}ms", identityUser.Id, syncTime.TotalMilliseconds);
@@ -138,17 +137,17 @@ public class UserSyncService : IUserSyncService
                 retryCount++;
                 var syncTime = DateTime.UtcNow - syncStartTime;
                 _logger.LogError(ex, "Failed to sync user {UserId} to MongoDB (attempt {RetryCount}/{MaxRetries}) after {SyncTime}ms", identityUser.Id, retryCount, maxRetries + 1, syncTime.TotalMilliseconds);
-                
+
                 if (retryCount > maxRetries)
                 {
                     _logger.LogError("Max retries reached for MongoDB sync of user {UserId} after {SyncTime}ms", identityUser.Id, syncTime.TotalMilliseconds);
                     throw; // Re-throw the exception after max retries
                 }
-                
+
                 // Reduced delay for faster retry
                 var delay = TimeSpan.FromSeconds(1); // Fixed 1 second delay instead of exponential backoff
                 _logger.LogInformation("Retrying MongoDB sync for user {UserId} in {Delay}ms", identityUser.Id, delay.TotalMilliseconds);
-                
+
                 try
                 {
                     await Task.Delay(delay, cancellationToken);
@@ -162,7 +161,7 @@ public class UserSyncService : IUserSyncService
         }
     }
 
-    public async Task UpdateUserInMongoDbAsync(User identityUser)
+    public async Task UpdateUserInMongoDbAsync(User identityUser,List<string> roles, CancellationToken cancellationToken = default)
     {
         if (_usersCollection == null || _connectionString == null)
         {
@@ -173,18 +172,18 @@ public class UserSyncService : IUserSyncService
         try
         {
             _logger.LogInformation("Starting MongoDB update for user {UserId}", identityUser.Id);
-            
+
             var filter = Builders<BsonDocument>.Filter.Eq("IdentityUserId", identityUser.Id.ToString());
             var update = Builders<BsonDocument>.Update
                 .Set("UserName", identityUser.UserName ?? string.Empty)
                 .Set("IsPrivate", identityUser.IsPrivate)
-                .Set("UpdatedAt", DateTime.UtcNow);
-                
+                .Set("UpdatedAt", DateTime.UtcNow)
+                .Set("Roles", new BsonArray(roles ?? new List<string>()));
+
             var result = await _usersCollection.UpdateOneAsync(filter, update);
             if (result.MatchedCount == 0)
             {
-                _logger.LogWarning("User {UserId} not found in MongoDB, creating new entry", identityUser.Id);
-                await SyncUserToMongoDbAsync(identityUser);
+                _logger.LogWarning("User {UserId} not found in MongoDB", identityUser.Id);
             }
             else
             {
@@ -209,7 +208,7 @@ public class UserSyncService : IUserSyncService
         try
         {
             _logger.LogInformation("Starting MongoDB deletion for user {UserId}", identityUserId);
-            
+
             var filter = Builders<BsonDocument>.Filter.Eq("IdentityUserId", identityUserId);
             var result = await _usersCollection.DeleteOneAsync(filter);
             if (result.DeletedCount == 0)
@@ -249,4 +248,5 @@ public class MongoUserDto
     public string UserName { get; set; } = string.Empty;
     public bool IsPrivate { get; set; }
     public DateTime CreatedAt { get; set; }
-} 
+    public List<string> Roles { get; set; } = new();
+}
