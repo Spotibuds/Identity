@@ -394,7 +394,7 @@ public class AuthController : ControllerBase
                 {
                     IList<string> roles = await _userManager.GetRolesAsync(user);
                     List<string> rolesList = roles.ToList();
-                    await _userSyncService.UpdateUserInMongoDbAsync(user,rolesList);
+                    await _userSyncService.UpdateUserInMongoDbAsync(user, rolesList);
                 }
                 catch (Exception ex)
                 {
@@ -517,6 +517,7 @@ public class AuthController : ControllerBase
         }
     }
 
+    [Authorize(Roles = "Admin")]
     [HttpPut("users/{id}")]
     public async Task<IActionResult> UpdateUser(Guid id, [FromBody] UpdateUserDto dto)
     {
@@ -550,7 +551,7 @@ public class AuthController : ControllerBase
                 {
                     IList<string> roles = await _userManager.GetRolesAsync(user);
                     List<string> rolesList = roles.ToList();
-                    await _userSyncService.UpdateUserInMongoDbAsync(user,rolesList);
+                    await _userSyncService.UpdateUserInMongoDbAsync(user, rolesList);
                 }
                 catch (Exception ex)
                 {
@@ -570,6 +571,7 @@ public class AuthController : ControllerBase
         }
     }
 
+    [Authorize]
     [HttpPost("refresh")]
     public async Task<IActionResult> RefreshToken([FromBody] RefreshTokenDto dto)
     {
@@ -713,18 +715,21 @@ public class AuthController : ControllerBase
         }
     }
 
+    [Authorize(Roles = "Admin")]
     [HttpGet("users")]
     public async Task<IActionResult> GetAllUsers()
     {
         try
         {
+            var roles = await _roleManager.Roles.Select(r => r.Name).ToListAsync();
             var users = await _userManager.Users.Select(u => new
             {
                 Id = u.Id.ToString(),
                 UserName = u.UserName,
                 Email = u.Email,
                 IsPrivate = u.IsPrivate,
-                CreatedAt = u.CreatedAt
+                CreatedAt = u.CreatedAt,
+                roles = roles,
             }).ToListAsync();
 
             return Ok(users);
@@ -733,6 +738,153 @@ public class AuthController : ControllerBase
         {
             _logger.LogError(ex, "Error getting all users");
             return StatusCode(500, "Internal server error");
+        }
+    }
+
+    [Authorize(Roles = "Admin")]
+    [HttpPost("create-admin")]
+    public async Task<IActionResult> CreateAdmin([FromBody] RegisterDto dto)
+    {
+        var startTime = DateTime.UtcNow;
+        try
+        {
+            _logger.LogInformation("Registration attempt for user: {Username}, Email: {Email}", dto.Username, dto.Email);
+
+            // Test database connectivity before proceeding
+            var dbCheckStart = DateTime.UtcNow;
+            try
+            {
+                await _dbContext.Database.CanConnectAsync();
+                var dbCheckTime = DateTime.UtcNow - dbCheckStart;
+                _logger.LogInformation("Database connectivity check completed in {DbCheckTime}ms", dbCheckTime.TotalMilliseconds);
+            }
+            catch (Exception dbEx)
+            {
+                var dbCheckTime = DateTime.UtcNow - dbCheckStart;
+                _logger.LogError(dbEx, "Database connectivity check failed during registration after {DbCheckTime}ms", dbCheckTime.TotalMilliseconds);
+                return StatusCode(500, new { message = "Database temporarily unavailable. Please try again later.", detail = "Database connection failed" });
+            }
+
+            var existingUser = await _userManager.FindByEmailAsync(dto.Email);
+            if (existingUser != null)
+            {
+                _logger.LogWarning("Registration failed: Email {Email} already exists", dto.Email);
+                return BadRequest(new { message = "User with this email already exists" });
+            }
+
+            existingUser = await _userManager.FindByNameAsync(dto.Username);
+            if (existingUser != null)
+            {
+                _logger.LogWarning("Registration failed: Username {Username} already taken", dto.Username);
+                return BadRequest(new { message = "Username is already taken" });
+            }
+
+            var user = new User
+            {
+                UserName = dto.Username,
+                Email = dto.Email,
+                IsPrivate = dto.IsPrivate ?? false,
+                CreatedAt = DateTime.UtcNow,
+            };
+
+            var userCreateStart = DateTime.UtcNow;
+            _logger.LogInformation("Creating user {Username} with Identity", dto.Username);
+            var result = await _userManager.CreateAsync(user, dto.Password);
+            var userCreateTime = DateTime.UtcNow - userCreateStart;
+            _logger.LogInformation("User creation completed in {UserCreateTime}ms", userCreateTime.TotalMilliseconds);
+
+            if (result.Succeeded)
+            {
+                _logger.LogInformation("User {UserId} created successfully in Identity, adding to User role", user.Id);
+
+                // Add user to role with error handling
+                var roleAddStart = DateTime.UtcNow;
+                try
+                {
+                    await _userManager.AddToRoleAsync(user, "Admin");
+                    var roleAddTime = DateTime.UtcNow - roleAddStart;
+                    _logger.LogInformation("User {UserId} added to User role successfully in {RoleAddTime}ms", user.Id, roleAddTime.TotalMilliseconds);
+                }
+                catch (Exception roleEx)
+                {
+                    var roleAddTime = DateTime.UtcNow - roleAddStart;
+                    _logger.LogError(roleEx, "Failed to add user {UserId} to User role after {RoleAddTime}ms, but registration will continue", user.Id, roleAddTime.TotalMilliseconds);
+                }
+
+                // Sync to MongoDB - this is required for the system to work properly
+                var mongoSyncStart = DateTime.UtcNow;
+                try
+                {
+                    _logger.LogInformation("Syncing user {UserId} to MongoDB", user.Id);
+                    IList<string> roles = await _userManager.GetRolesAsync(user);
+                    List<string> rolesList = roles.ToList();
+                    // Add timeout for MongoDB sync operation
+                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15)); // Reduced from 20 to 15 seconds
+                    await _userSyncService.SyncUserToMongoDbAsync(user, rolesList, cts.Token);
+                    var mongoSyncTime = DateTime.UtcNow - mongoSyncStart;
+                    _logger.LogInformation("User {UserId} synced to MongoDB successfully in {MongoSyncTime}ms", user.Id, mongoSyncTime.TotalMilliseconds);
+                }
+                catch (OperationCanceledException)
+                {
+                    var mongoSyncTime = DateTime.UtcNow - mongoSyncStart;
+                    _logger.LogError("MongoDB sync timeout for user {UserId} during registration after {MongoSyncTime}ms", user.Id, mongoSyncTime.TotalMilliseconds);
+
+                    // MongoDB sync timeout - clean up the Identity user
+                    try
+                    {
+                        await _userManager.DeleteAsync(user);
+                        _logger.LogInformation("Cleaned up Identity user {UserId} due to MongoDB sync timeout", user.Id);
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        _logger.LogError(cleanupEx, "Failed to clean up Identity user {UserId} after MongoDB sync timeout", user.Id);
+                    }
+
+                    return StatusCode(500, new { message = "User registration failed due to database synchronization timeout. Please try again.", detail = "MongoDB sync operation timed out" });
+                }
+                catch (Exception ex)
+                {
+                    var mongoSyncTime = DateTime.UtcNow - mongoSyncStart;
+                    _logger.LogError(ex, "Failed to sync user {UserId} to MongoDB during registration after {MongoSyncTime}ms", user.Id, mongoSyncTime.TotalMilliseconds);
+
+                    // MongoDB sync failure is critical - we should clean up the Identity user
+                    try
+                    {
+                        await _userManager.DeleteAsync(user);
+                        _logger.LogInformation("Cleaned up Identity user {UserId} due to MongoDB sync failure", user.Id);
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        _logger.LogError(cleanupEx, "Failed to clean up Identity user {UserId} after MongoDB sync failure", user.Id);
+                    }
+
+                    return StatusCode(500, new { message = "User registration failed due to database synchronization error", detail = ex.Message });
+                }
+
+                var totalTime = DateTime.UtcNow - startTime;
+                _logger.LogInformation("User {UserId} registered successfully in {TotalTime}ms", user.Id, totalTime.TotalMilliseconds);
+                return Ok(new { message = "User registered successfully", userId = user.Id });
+            }
+
+            // Log specific validation errors
+            var errors = result.Errors.Select(e => e.Description).ToList();
+            _logger.LogWarning("User registration failed for {Username}: {Errors}", dto.Username, string.Join(", ", errors));
+            return BadRequest(new { message = "Registration failed", errors = errors });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unexpected error during user registration for {Username}: {Error}", dto.Username, ex.Message);
+
+            // Log stack trace for debugging
+            _logger.LogError("Stack trace: {StackTrace}", ex.StackTrace);
+
+            // Check if it's a database-related exception
+            if (ex.Message.Contains("transient") || ex.Message.Contains("connection") || ex.Message.Contains("timeout"))
+            {
+                return StatusCode(500, new { message = "Database temporarily unavailable. Please try again in a moment.", detail = "Transient database error" });
+            }
+
+            return StatusCode(500, new { message = "An error occurred during registration", detail = ex.Message });
         }
     }
 }
