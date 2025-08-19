@@ -517,7 +517,7 @@ public class AuthController : ControllerBase
     }
 
     [Authorize(Roles = "Admin")]
-    [HttpPut("delete/{id}")]
+    [HttpPut("users/{id}")]
     public async Task<IActionResult> UpdateUser(Guid id, [FromBody] UpdateUserDto dto)
     {
         try
