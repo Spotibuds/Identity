@@ -714,7 +714,7 @@ public class AuthController : ControllerBase
         }
     }
 
-    [HttpDelete("users/de{id}")]
+    [HttpDelete("users/{id}")]
     public async Task<IActionResult> DeleteUser(Guid id)
     {
         try
