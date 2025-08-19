@@ -448,7 +448,6 @@ public class AuthController : ControllerBase
         }
     }
 
-    [Authorize(Roles = "Admin")]
     [HttpPost("users/{id}/roles/{role}")]
     public async Task<IActionResult> AssignRole(Guid id, string role)
     {
@@ -518,7 +517,7 @@ public class AuthController : ControllerBase
     }
 
     [Authorize(Roles = "Admin")]
-    [HttpPut("users/{id}")]
+    [HttpPut("delete/{id}")]
     public async Task<IActionResult> UpdateUser(Guid id, [FromBody] UpdateUserDto dto)
     {
         try
@@ -715,24 +714,69 @@ public class AuthController : ControllerBase
         }
     }
 
-    [Authorize(Roles = "Admin")]
+    [HttpDelete("users/de{id}")]
+    public async Task<IActionResult> DeleteUser(Guid id)
+    {
+        try
+        {
+            var user = await _userManager.FindByIdAsync(id.ToString());
+            if (user == null)
+            {
+                return NotFound(new { message = "User not found" });
+            }
+
+            var result = await _userManager.DeleteAsync(user);
+            if (result.Succeeded)
+            {
+                _logger.LogInformation("User {UserId} deleted successfully", id);
+
+                try
+                {
+                    await _userSyncService.DeleteUserFromMongoDbAsync(user.Id.ToString());
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to remove user {UserId} from MongoDB", user.Id);
+                }
+
+                return Ok(new { message = "User deleted successfully" });
+            }
+
+            return BadRequest(new { message = "User deletion failed", errors = result.Errors.Select(e => e.Description) });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error deleting user {UserId}", id);
+            return StatusCode(500, new { message = "An error occurred during deletion" });
+        }
+    }
+
     [HttpGet("users")]
     public async Task<IActionResult> GetAllUsers()
     {
         try
         {
-            var roles = await _roleManager.Roles.Select(r => r.Name).ToListAsync();
-            var users = await _userManager.Users.Select(u => new
-            {
-                Id = u.Id.ToString(),
-                UserName = u.UserName,
-                Email = u.Email,
-                IsPrivate = u.IsPrivate,
-                CreatedAt = u.CreatedAt,
-                roles = roles,
-            }).ToListAsync();
+            var users = await _userManager.Users.ToListAsync();
+            var userList = new List<object>();
 
-            return Ok(users);
+            foreach (var user in users)
+            {
+                var roles = await _userManager.GetRolesAsync(user);
+                if (roles.Contains("User"))
+                {
+                    userList.Add(new
+                    {
+                        Id = user.Id,
+                        UserName = user.UserName,
+                        Email = user.Email,
+                        IsPrivate = user.IsPrivate,
+                        CreatedAt = user.CreatedAt,
+                        Roles = roles
+                    });
+                }
+            }
+
+            return Ok(userList);
         }
         catch (Exception ex)
         {
@@ -741,7 +785,40 @@ public class AuthController : ControllerBase
         }
     }
 
-    [Authorize(Roles = "Admin")]
+    [HttpGet("admins")]
+    public async Task<IActionResult> GetAllAdmins()
+    {
+        try
+        {
+            var users = await _userManager.Users.ToListAsync();
+            var adminList = new List<object>();
+
+            foreach (var user in users)
+            {
+                var roles = await _userManager.GetRolesAsync(user);
+                if (roles.Contains("Admin"))
+                {
+                    adminList.Add(new
+                    {
+                        Id = user.Id,
+                        UserName = user.UserName,
+                        Email = user.Email,
+                        IsPrivate = user.IsPrivate,
+                        CreatedAt = user.CreatedAt,
+                        Roles = roles
+                    });
+                }
+            }
+
+            return Ok(adminList);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting all admins");
+            return StatusCode(500, "Internal server error");
+        }
+    }
+
     [HttpPost("create-admin")]
     public async Task<IActionResult> CreateAdmin([FromBody] RegisterDto dto)
     {
@@ -818,7 +895,6 @@ public class AuthController : ControllerBase
                     _logger.LogInformation("Syncing user {UserId} to MongoDB", user.Id);
                     IList<string> roles = await _userManager.GetRolesAsync(user);
                     List<string> rolesList = roles.ToList();
-                    // Add timeout for MongoDB sync operation
                     using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15)); // Reduced from 20 to 15 seconds
                     await _userSyncService.SyncUserToMongoDbAsync(user, rolesList, cts.Token);
                     var mongoSyncTime = DateTime.UtcNow - mongoSyncStart;
