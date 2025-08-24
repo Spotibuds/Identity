@@ -69,21 +69,28 @@ namespace Identity
                         {
                             if (allowedOrigins == "*")
                             {
-                                policy.AllowAnyOrigin();
+                                // For development only - no credentials with wildcard
+                                policy.AllowAnyOrigin()
+                                      .AllowAnyHeader()
+                                      .AllowAnyMethod();
                             }
                             else
                             {
                                 var origins = allowedOrigins.Split(',', StringSplitOptions.RemoveEmptyEntries);
-                                policy.WithOrigins(origins);
+                                policy.WithOrigins(origins)
+                                      .AllowAnyHeader()
+                                      .AllowAnyMethod()
+                                      .AllowCredentials(); // Allow credentials for specific origins
                             }
                         }
                         else
                         {
-                            policy.AllowAnyOrigin();
+                            // Default to localhost for development
+                            policy.WithOrigins("http://localhost:3000", "https://localhost:3000")
+                                  .AllowAnyHeader()
+                                  .AllowAnyMethod()
+                                  .AllowCredentials();
                         }
-                        
-                        policy.AllowAnyHeader()
-                              .AllowAnyMethod();
                     });
             });
 
