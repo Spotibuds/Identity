@@ -962,6 +962,56 @@ public class AuthController : ControllerBase
             return StatusCode(500, new { message = "An error occurred during registration", detail = ex.Message });
         }
     }
+    
+    [HttpPost("users/{id}/promote-to-admin")]
+    public async Task<IActionResult> PromoteToAdmin(Guid id)
+    {
+        try
+        {
+            var user = await _userManager.FindByIdAsync(id.ToString());
+            if (user == null)
+            {
+                return NotFound(new { message = "User not found" });
+            }
+
+            var isAdmin = await _userManager.IsInRoleAsync(user, "Admin");
+            if (isAdmin)
+            {
+                return BadRequest(new { message = "User is already an admin" });
+            }
+
+            var roleExists = await _roleManager.RoleExistsAsync("Admin");
+            if (!roleExists)
+            {
+                return BadRequest(new { message = "Admin role does not exist" });
+            }
+
+            var result = await _userManager.AddToRoleAsync(user, "Admin");
+            if (!result.Succeeded)
+            {
+                return BadRequest(new { message = "Failed to promote user", errors = result.Errors.Select(e => e.Description) });
+            }
+
+            try
+            {
+                var roles = await _userManager.GetRolesAsync(user);
+                await _userSyncService.UpdateUserInMongoDbAsync(user, roles.ToList());
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to sync promoted admin user {UserId} to MongoDB", user.Id);
+            }
+
+            _logger.LogInformation("User {UserId} promoted to admin successfully", user.Id);
+            return Ok(new { message = "User promoted to admin successfully" });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error promoting user {UserId} to admin", id);
+            return StatusCode(500, new { message = "An error occurred while promoting the user", detail = ex.Message });
+        }
+    }
+
 }
 
 public class RegisterDto
