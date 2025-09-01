@@ -962,7 +962,7 @@ public class AuthController : ControllerBase
             return StatusCode(500, new { message = "An error occurred during registration", detail = ex.Message });
         }
     }
-    
+
     [HttpPost("users/{id}/promote-to-admin")]
     public async Task<IActionResult> PromoteToAdmin(Guid id)
     {
@@ -986,7 +986,9 @@ public class AuthController : ControllerBase
                 return BadRequest(new { message = "Admin role does not exist" });
             }
 
+            await _userManager.RemoveFromRoleAsync(user, "User");
             var result = await _userManager.AddToRoleAsync(user, "Admin");
+
             if (!result.Succeeded)
             {
                 return BadRequest(new { message = "Failed to promote user", errors = result.Errors.Select(e => e.Description) });
@@ -1008,6 +1010,57 @@ public class AuthController : ControllerBase
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error promoting user {UserId} to admin", id);
+            return StatusCode(500, new { message = "An error occurred while promoting the user", detail = ex.Message });
+        }
+    }
+
+     [HttpPost("users/{id}/demote-to-user")]
+    public async Task<IActionResult> DemoteToUser(Guid id)
+    {
+        try
+        {
+            var user = await _userManager.FindByIdAsync(id.ToString());
+            if (user == null)
+            {
+                return NotFound(new { message = "User not found" });
+            }
+
+            var isAdmin = await _userManager.IsInRoleAsync(user, "Admin");
+            if (!isAdmin)
+            {
+                return BadRequest(new { message = "User is already not admin" });
+            }
+
+            var roleExists = await _roleManager.RoleExistsAsync("User");
+            if (!roleExists)
+            {
+                return BadRequest(new { message = "User role does not exist" });
+            }
+
+            await _userManager.RemoveFromRoleAsync(user, "Admin");
+            var result = await _userManager.AddToRoleAsync(user, "User");
+
+            if (!result.Succeeded)
+            {
+                return BadRequest(new { message = "Failed to demote admin", errors = result.Errors.Select(e => e.Description) });
+            }
+
+            try
+            {
+                var roles = await _userManager.GetRolesAsync(user);
+                await _userSyncService.UpdateUserInMongoDbAsync(user, roles.ToList());
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to sync promoted admin user {UserId} to MongoDB", user.Id);
+            }
+
+            _logger.LogInformation("User {UserId} demoted to user successfully", user.Id);
+            return Ok(new { message = "Admin demoted to user successfully" });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error demoting admin {UserId} to user", id);
             return StatusCode(500, new { message = "An error occurred while promoting the user", detail = ex.Message });
         }
     }
