@@ -713,6 +713,7 @@ public class AuthController : ControllerBase
         }
     }
 
+    [Authorize(Roles = "Admin")]
     [HttpDelete("users/{id}")]
     public async Task<IActionResult> DeleteUser(Guid id)
     {
@@ -750,6 +751,7 @@ public class AuthController : ControllerBase
         }
     }
 
+    [Authorize(Roles = "Admin")]
     [HttpGet("users")]
     public async Task<IActionResult> GetAllUsers()
     {
@@ -784,6 +786,7 @@ public class AuthController : ControllerBase
         }
     }
 
+    [Authorize(Roles = "Admin")]
     [HttpGet("admins")]
     public async Task<IActionResult> GetAllAdmins()
     {
@@ -818,6 +821,7 @@ public class AuthController : ControllerBase
         }
     }
 
+    [Authorize(Roles = "Admin")]
     [HttpPost("create-admin")]
     public async Task<IActionResult> CreateAdmin([FromBody] RegisterDto dto)
     {
@@ -963,6 +967,7 @@ public class AuthController : ControllerBase
         }
     }
 
+    [Authorize(Roles = "Admin")]
     [HttpPost("users/{id}/promote-to-admin")]
     public async Task<IActionResult> PromoteToAdmin(Guid id)
     {
@@ -1014,7 +1019,8 @@ public class AuthController : ControllerBase
         }
     }
 
-     [HttpPost("users/{id}/demote-to-user")]
+    [Authorize(Roles = "Admin")]
+    [HttpPost("users/{id}/demote-to-user")]
     public async Task<IActionResult> DemoteToUser(Guid id)
     {
         try
