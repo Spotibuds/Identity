@@ -11,6 +11,9 @@ public class IdentityDbContext : IdentityDbContext<User, Microsoft.AspNetCore.Id
     }
 
     public DbSet<RefreshToken> RefreshTokens { get; set; }
+    public DbSet<ProfileSyncWork> ProfileSyncWork { get; set; }
+    public DbSet<PasswordReset> PasswordResets { get; set; }
+    public DbSet<SessionFamily> SessionFamilies { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -40,7 +43,17 @@ public class IdentityDbContext : IdentityDbContext<User, Microsoft.AspNetCore.Id
             entity.HasIndex(e => e.UserId);
             entity.HasIndex(e => e.Token).IsUnique();
             entity.HasIndex(e => e.ExpiresAt);
+            entity.HasIndex(e => e.FamilyId);
+            entity.HasIndex(e => new { e.IsPending, e.PreparationExpiresAt });
         });
+
+        modelBuilder.Entity<ProfileSyncWork>().HasIndex(e => new { e.UserId, e.Delete });
+        modelBuilder.Entity<ProfileSyncWork>().HasIndex(e => e.NextAttemptAt);
+        modelBuilder.Entity<PasswordReset>().Property(e => e.TokenHash).HasMaxLength(64);
+        modelBuilder.Entity<PasswordReset>().HasIndex(e => e.TokenHash).IsUnique();
+        modelBuilder.Entity<PasswordReset>().HasOne<User>().WithMany().HasForeignKey(e => e.UserId).OnDelete(DeleteBehavior.Cascade);
+        modelBuilder.Entity<SessionFamily>().HasIndex(e => e.UserId);
+        modelBuilder.Entity<SessionFamily>().HasOne(e => e.User).WithMany().HasForeignKey(e => e.UserId).OnDelete(DeleteBehavior.Cascade);
 
         // Identity table names
         modelBuilder.Entity<Microsoft.AspNetCore.Identity.IdentityRole<Guid>>().ToTable("Roles");
@@ -50,4 +63,4 @@ public class IdentityDbContext : IdentityDbContext<User, Microsoft.AspNetCore.Id
         modelBuilder.Entity<Microsoft.AspNetCore.Identity.IdentityUserToken<Guid>>().ToTable("UserTokens");
         modelBuilder.Entity<Microsoft.AspNetCore.Identity.IdentityRoleClaim<Guid>>().ToTable("RoleClaims");
     }
-} 
+}

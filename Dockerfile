@@ -1,19 +1,14 @@
-FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS base
-WORKDIR /app
-EXPOSE 80
-
-FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0.401 AS build
 WORKDIR /src
-COPY ["Identity.csproj", "."]
-RUN dotnet restore "Identity.csproj"
+COPY Identity.csproj packages.lock.json ./
+RUN dotnet restore Identity.csproj --locked-mode
 COPY . .
-WORKDIR "/src"
-RUN dotnet build "Identity.csproj" -c Release -o /app/build
+RUN dotnet publish Identity.csproj -c Release --no-restore -o /app/publish /p:UseAppHost=false
 
-FROM build AS publish
-RUN dotnet publish "Identity.csproj" -c Release -o /app/publish /p:UseAppHost=false
-
-FROM base AS final
+FROM mcr.microsoft.com/dotnet/aspnet:8.0.31 AS final
 WORKDIR /app
-COPY --from=publish /app/publish .
-ENTRYPOINT ["dotnet", "Identity.dll"] 
+ENV ASPNETCORE_HTTP_PORTS=8080
+EXPOSE 8080
+USER $APP_UID
+COPY --from=build /app/publish .
+ENTRYPOINT ["dotnet", "Identity.dll"]

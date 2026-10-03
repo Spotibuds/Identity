@@ -6,6 +6,7 @@ namespace Identity.Entities;
 public class User : IdentityUser<Guid>
 {
     public bool IsPrivate { get; set; } = false;
-    
+
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
-} 
+    public bool IsDeleted { get; set; }
+}

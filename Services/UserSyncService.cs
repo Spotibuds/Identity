@@ -4,249 +4,37 @@ using MongoDB.Driver;
 
 namespace Identity.Services;
 
-public class UserSyncService : IUserSyncService
+public class UserSyncService(IMongoDatabase database, HttpClient http, IConfiguration config) : IUserSyncService
 {
-    private readonly HttpClient _httpClient;
-    private readonly ILogger<UserSyncService> _logger;
-    private readonly IMongoCollection<BsonDocument>? _usersCollection;
-    private readonly string? _connectionString;
+    public Task SyncUserToMongoDbAsync(User user, List<string> roles, CancellationToken ct = default) => UpdateUserInMongoDbAsync(user, roles, ct);
 
-    public UserSyncService(HttpClient httpClient, ILogger<UserSyncService> logger, IConfiguration configuration)
+    public async Task UpdateUserInMongoDbAsync(User user, List<string> roles, CancellationToken ct = default)
     {
-        _httpClient = httpClient;
-        _logger = logger;
-
-        var mongoConnectionString = configuration.GetConnectionString("MongoDb");
-        if (string.IsNullOrEmpty(mongoConnectionString))
-        {
-            _logger.LogWarning("MongoDB connection string not found. User synchronization will be disabled.");
-            _connectionString = null;
-            _usersCollection = null;
-            return;
-        }
-
-        // Fix the connection string - remove authMechanism=DEFAULT which can cause issues
-        _connectionString = mongoConnectionString.Replace("&authMechanism=DEFAULT", "").Replace("?authMechanism=DEFAULT&", "?").Replace("?authMechanism=DEFAULT", "");
-
-        _logger.LogInformation("Initializing MongoDB connection...");
-
-        try
-        {
-            var mongoClientSettings = MongoClientSettings.FromConnectionString(_connectionString);
-            mongoClientSettings.ServerSelectionTimeout = TimeSpan.FromSeconds(5); // Reduced from 10 to 5
-            mongoClientSettings.ConnectTimeout = TimeSpan.FromSeconds(5); // Reduced from 10 to 5
-            mongoClientSettings.SocketTimeout = TimeSpan.FromSeconds(5); // Reduced from 10 to 5
-
-            var mongoClient = new MongoClient(mongoClientSettings);
-            var mongoDatabase = mongoClient.GetDatabase("spotibuds");
-            _usersCollection = mongoDatabase.GetCollection<BsonDocument>("users");
-
-            _logger.LogInformation("MongoDB client initialized successfully with optimized settings. Connection will be tested on first use.");
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to initialize MongoDB client. User synchronization will be disabled.");
-            _connectionString = null;
-            _usersCollection = null;
-        }
-    }
-
-    private async Task<bool> TestConnectionAsync(CancellationToken cancellationToken = default)
-    {
-        if (_connectionString == null)
-        {
-            return false;
-        }
-
-        try
-        {
-            _logger.LogInformation("Testing MongoDB connection...");
-            var mongoClientSettings = MongoClientSettings.FromConnectionString(_connectionString);
-            mongoClientSettings.ServerSelectionTimeout = TimeSpan.FromSeconds(5); // Reduced from 10 to 5
-            mongoClientSettings.ConnectTimeout = TimeSpan.FromSeconds(5); // Reduced from 10 to 5
-            mongoClientSettings.SocketTimeout = TimeSpan.FromSeconds(5); // Reduced from 10 to 5
-
-            var mongoClient = new MongoClient(mongoClientSettings);
-            var mongoDatabase = mongoClient.GetDatabase("spotibuds");
-
-            // Use a simpler ping command with timeout
-            var result = await mongoDatabase.RunCommandAsync<BsonDocument>(new BsonDocument("ping", 1), cancellationToken: cancellationToken);
-            _logger.LogInformation("MongoDB connection test successful: {Result}", result.ToJson());
-            return true;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "MongoDB connection test failed");
-            return false;
-        }
-    }
-
-    public async Task SyncUserToMongoDbAsync(User identityUser,List<string> roles, CancellationToken cancellationToken = default)
-    {
-        if (_usersCollection == null || _connectionString == null)
-        {
-            _logger.LogWarning("MongoDB not configured. Skipping user sync for user {UserId}", identityUser.Id);
-            return;
-        }
-
-        const int maxRetries = 1; // Reduced from 2 to 1 for faster failure
-        var retryCount = 0;
-        var syncStartTime = DateTime.UtcNow;
-
-        while (retryCount <= maxRetries)
-        {
-            try
-            {
-                _logger.LogInformation("Starting MongoDB sync for user {UserId} (attempt {RetryCount}/{MaxRetries})", identityUser.Id, retryCount + 1, maxRetries + 1);
-
-                // Skip connection test on retry to save time
-                if (retryCount == 0 && !await TestConnectionAsync(cancellationToken))
-                {
-                    throw new InvalidOperationException("MongoDB connection test failed before user sync");
-                }
-
-                var userDoc = new BsonDocument
-                {
-                    { "IdentityUserId", identityUser.Id.ToString() },
-                    { "UserName", identityUser.UserName ?? string.Empty },
-                    { "DisplayName", string.Empty },
-                    { "Bio", string.Empty },
-                    {"Roles", new BsonArray(roles ?? new List<string>()) },
-                    { "AvatarUrl", BsonNull.Value },
-                    { "IsPrivate", identityUser.IsPrivate },
-                    { "Playlists", new BsonArray() },
-                    { "FollowedUsers", new BsonArray() },
-                    { "Followers", new BsonArray() },
-                    { "CreatedAt", identityUser.CreatedAt },
-                    { "UpdatedAt", BsonNull.Value }
-                };
-
-                await _usersCollection.InsertOneAsync(userDoc, cancellationToken: cancellationToken);
-                var syncTime = DateTime.UtcNow - syncStartTime;
-                _logger.LogInformation("Successfully synced user {UserId} to MongoDB in {SyncTime}ms", identityUser.Id, syncTime.TotalMilliseconds);
-                return; // Success, exit the retry loop
-            }
-            catch (OperationCanceledException)
-            {
-                var syncTime = DateTime.UtcNow - syncStartTime;
-                _logger.LogWarning("MongoDB sync operation was cancelled for user {UserId} after {SyncTime}ms", identityUser.Id, syncTime.TotalMilliseconds);
-                throw; // Don't retry on cancellation
-            }
-            catch (Exception ex)
-            {
-                retryCount++;
-                var syncTime = DateTime.UtcNow - syncStartTime;
-                _logger.LogError(ex, "Failed to sync user {UserId} to MongoDB (attempt {RetryCount}/{MaxRetries}) after {SyncTime}ms", identityUser.Id, retryCount, maxRetries + 1, syncTime.TotalMilliseconds);
-
-                if (retryCount > maxRetries)
-                {
-                    _logger.LogError("Max retries reached for MongoDB sync of user {UserId} after {SyncTime}ms", identityUser.Id, syncTime.TotalMilliseconds);
-                    throw; // Re-throw the exception after max retries
-                }
-
-                // Reduced delay for faster retry
-                var delay = TimeSpan.FromSeconds(1); // Fixed 1 second delay instead of exponential backoff
-                _logger.LogInformation("Retrying MongoDB sync for user {UserId} in {Delay}ms", identityUser.Id, delay.TotalMilliseconds);
-
-                try
-                {
-                    await Task.Delay(delay, cancellationToken);
-                }
-                catch (OperationCanceledException)
-                {
-                    _logger.LogWarning("Retry delay was cancelled for user {UserId}", identityUser.Id);
-                    throw; // Don't retry if cancellation was requested during delay
-                }
-            }
-        }
-    }
-
-    public async Task UpdateUserInMongoDbAsync(User identityUser,List<string> roles, CancellationToken cancellationToken = default)
-    {
-        if (_usersCollection == null || _connectionString == null)
-        {
-            _logger.LogWarning("MongoDB not configured. Skipping user update for user {UserId}", identityUser.Id);
-            return;
-        }
-
-        try
-        {
-            _logger.LogInformation("Starting MongoDB update for user {UserId}", identityUser.Id);
-
-            var filter = Builders<BsonDocument>.Filter.Eq("IdentityUserId", identityUser.Id.ToString());
-            var update = Builders<BsonDocument>.Update
-                .Set("UserName", identityUser.UserName ?? string.Empty)
-                .Set("IsPrivate", identityUser.IsPrivate)
-                .Set("UpdatedAt", DateTime.UtcNow)
-                .Set("Roles", new BsonArray(roles ?? new List<string>()));
-
-            var result = await _usersCollection.UpdateOneAsync(filter, update);
-            if (result.MatchedCount == 0)
-            {
-                _logger.LogWarning("User {UserId} not found in MongoDB", identityUser.Id);
-            }
-            else
-            {
-                _logger.LogInformation("Successfully updated user {UserId} in MongoDB", identityUser.Id);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to update user {UserId} in MongoDB", identityUser.Id);
-            throw; // Re-throw the exception
-        }
+        var users = database.GetCollection<BsonDocument>("users");
+        var filter = Builders<BsonDocument>.Filter.Eq("IdentityUserId", user.Id.ToString());
+        var update = Builders<BsonDocument>.Update.Set("UserName", user.UserName).Set("IsPrivate", user.IsPrivate)
+            .Set("Roles", new BsonArray(roles)).Set("UpdatedAt", DateTime.UtcNow)
+            .SetOnInsert("_id", ObjectId.GenerateNewId()).SetOnInsert("IdentityUserId", user.Id.ToString())
+            .SetOnInsert("CreatedAt", user.CreatedAt).SetOnInsert("DisplayName", "").SetOnInsert("Bio", "")
+            .SetOnInsert("AvatarUrl", BsonNull.Value).SetOnInsert("Playlists", new BsonArray())
+            .SetOnInsert("FollowedUsers", new BsonArray()).SetOnInsert("Followers", new BsonArray())
+            .SetOnInsert("ListeningHistory", new BsonArray());
+        await users.UpdateOneAsync(filter, update, new UpdateOptions { IsUpsert = true }, ct);
     }
 
     public async Task DeleteUserFromMongoDbAsync(string identityUserId)
     {
-        if (_usersCollection == null || _connectionString == null)
-        {
-            _logger.LogWarning("MongoDB not configured. Skipping user deletion for user {UserId}", identityUserId);
-            return;
-        }
-
-        try
-        {
-            _logger.LogInformation("Starting MongoDB deletion for user {UserId}", identityUserId);
-
-            var filter = Builders<BsonDocument>.Filter.Eq("IdentityUserId", identityUserId);
-            var result = await _usersCollection.DeleteOneAsync(filter);
-            if (result.DeletedCount == 0)
-            {
-                _logger.LogWarning("User {UserId} not found in MongoDB for deletion", identityUserId);
-            }
-            else
-            {
-                _logger.LogInformation("Successfully deleted user {UserId} from MongoDB", identityUserId);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to delete user {UserId} from MongoDB", identityUserId);
-            throw; // Re-throw the exception
-        }
+        using var request = new HttpRequestMessage(HttpMethod.Delete,
+            config.Required("UserService:BaseUrl").TrimEnd('/') + "/api/users/internal/" + identityUserId);
+        request.Headers.Add("X-Spotibuds-Service", config.Required("ServiceAuth:Secret"));
+        using var response = await http.SendAsync(request);
+        if (!response.IsSuccessStatusCode) throw new HttpRequestException("User cleanup was not acknowledged", null, response.StatusCode);
     }
-}
 
-public class CreateUserForMongoDto
-{
-    public string IdentityUserId { get; set; } = string.Empty;
-    public string UserName { get; set; } = string.Empty;
-    public bool IsPrivate { get; set; } = false;
-}
-
-public class UpdateUserForMongoDto
-{
-    public string? UserName { get; set; }
-    public bool? IsPrivate { get; set; }
-}
-
-public class MongoUserDto
-{
-    public string Id { get; set; } = string.Empty;
-    public string IdentityUserId { get; set; } = string.Empty;
-    public string UserName { get; set; } = string.Empty;
-    public bool IsPrivate { get; set; }
-    public DateTime CreatedAt { get; set; }
-    public List<string> Roles { get; set; } = new();
+    public async Task EnsureIndexAsync(CancellationToken ct)
+    {
+        await database.GetCollection<BsonDocument>("users").Indexes.CreateOneAsync(
+            new CreateIndexModel<BsonDocument>(Builders<BsonDocument>.IndexKeys.Ascending("IdentityUserId"),
+                new CreateIndexOptions { Unique = true, Name = "identity_user_unique" }), cancellationToken: ct);
+    }
 }

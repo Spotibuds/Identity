@@ -3,6 +3,7 @@ using System;
 using Identity.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace Identity.Migrations
 {
     [DbContext(typeof(IdentityDbContext))]
-    partial class IdentityDbContextModelSnapshot : ModelSnapshot
+    [Migration("20261003171653_SafeLocalSessions")]
+    partial class SafeLocalSessions
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -86,7 +89,8 @@ namespace Identity.Migrations
 
                     b.HasIndex("NextAttemptAt");
 
-                    b.HasIndex("UserId", "Delete");
+                    b.HasIndex("UserId", "Delete")
+                        .IsUnique();
 
                     b.ToTable("ProfileSyncWork");
                 });
@@ -108,23 +112,10 @@ namespace Identity.Migrations
                     b.Property<Guid>("FamilyId")
                         .HasColumnType("uuid");
 
-                    b.Property<bool>("IsPending")
-                        .HasColumnType("boolean");
-
                     b.Property<bool>("IsRevoked")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("boolean")
                         .HasDefaultValue(false);
-
-                    b.Property<string>("OperationHash")
-                        .HasMaxLength(64)
-                        .HasColumnType("character varying(64)");
-
-                    b.Property<DateTime?>("PreparationExpiresAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<Guid?>("PreparedFromId")
-                        .HasColumnType("uuid");
 
                     b.Property<Guid?>("ReplacedById")
                         .HasColumnType("uuid");
@@ -151,37 +142,7 @@ namespace Identity.Migrations
 
                     b.HasIndex("UserId");
 
-                    b.HasIndex("IsPending", "PreparationExpiresAt");
-
                     b.ToTable("RefreshTokens");
-                });
-
-            modelBuilder.Entity("Identity.Entities.SessionFamily", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("uuid");
-
-                    b.Property<DateTime>("CreatedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<DateTime>("ExpiresAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<bool>("IsRevoked")
-                        .HasColumnType("boolean");
-
-                    b.Property<DateTime?>("UpdatedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<Guid>("UserId")
-                        .HasColumnType("uuid");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("UserId");
-
-                    b.ToTable("SessionFamilies");
                 });
 
             modelBuilder.Entity("Identity.Entities.User", b =>
@@ -402,17 +363,6 @@ namespace Identity.Migrations
                 });
 
             modelBuilder.Entity("Identity.Entities.RefreshToken", b =>
-                {
-                    b.HasOne("Identity.Entities.User", "User")
-                        .WithMany()
-                        .HasForeignKey("UserId")
-                        .OnDelete(DeleteBehavior.Cascade)
-                        .IsRequired();
-
-                    b.Navigation("User");
-                });
-
-            modelBuilder.Entity("Identity.Entities.SessionFamily", b =>
                 {
                     b.HasOne("Identity.Entities.User", "User")
                         .WithMany()

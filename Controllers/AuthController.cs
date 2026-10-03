@@ -1,1131 +1,426 @@
+using System.ComponentModel.DataAnnotations;
+using System.Security.Claims;
+using System.Security.Cryptography;
+using System.Text;
+using Identity.Data;
+using Identity.Entities;
+using Identity.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.IdentityModel.Tokens;
-using Identity.Entities;
-using Identity.Services;
-using Identity.Data;
-using System.IdentityModel.Tokens.Jwt;
-using System.Security.Claims;
-using System.Text;
-using System.ComponentModel.DataAnnotations;
-using System.Security.Cryptography;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
-using MongoDB.Bson;
-using MongoDB.Driver;
-using System.Text.Json.Serialization;
 
 namespace Identity.Controllers;
 
 [ApiController]
-[Route("api/[controller]")]
-public class AuthController : ControllerBase
+[Route("api/auth")]
+public class AuthController(UserManager<User> users, RoleManager<IdentityRole<Guid>> roles,
+    SignInManager<User> signIn, IdentityDbContext db, SessionService sessions, ProfileReconciler profiles,
+    IRecoveryMailer mailer, IConfiguration config, TimeProvider clock, IWebHostEnvironment environment) : ControllerBase
 {
-    private readonly UserManager<User> _userManager;
-    private readonly SignInManager<User> _signInManager;
-    private readonly RoleManager<IdentityRole<Guid>> _roleManager;
-    private readonly IConfiguration _configuration;
-    private readonly IUserSyncService _userSyncService;
-    private readonly ILogger<AuthController> _logger;
-    private readonly IdentityDbContext _dbContext;
+    private Guid Actor => Guid.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+    private const string RecoveryMessage = "If the account exists, a password reset message has been sent to the local inbox.";
 
-    public AuthController(
-        UserManager<User> userManager,
-        SignInManager<User> signInManager,
-        RoleManager<IdentityRole<Guid>> roleManager,
-        IConfiguration configuration,
-        IUserSyncService userSyncService,
-        ILogger<AuthController> logger,
-        IdentityDbContext dbContext)
+    private bool BrowserRequestAllowed() => Request.Headers["X-Spotibuds-Request"] == "1" &&
+        (!Request.Headers.TryGetValue("Origin", out var origin) || config.Required("Cors:AllowedOrigins")
+            .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).Contains(origin.ToString(), StringComparer.Ordinal));
+
+    private bool ServiceAllowed()
     {
-        _userManager = userManager;
-        _signInManager = signInManager;
-        _roleManager = roleManager;
-        _configuration = configuration;
-        _userSyncService = userSyncService;
-        _logger = logger;
-        _dbContext = dbContext;
+        var presented = Request.Headers["X-Spotibuds-Service"].ToString();
+        var expected = config.Required("ServiceAuth:Secret");
+        return presented.Length == expected.Length && CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(presented), Encoding.UTF8.GetBytes(expected));
     }
 
-    private async Task<string> GenerateJwtTokenAsync(User user)
+    private void SetCookie(string credential, DateTime expiresAt) => Response.Cookies.Append(SessionService.CookieName, credential,
+        new CookieOptions { HttpOnly = true, Secure = !environment.IsDevelopment() && !environment.IsEnvironment("Test") || Request.IsHttps, SameSite = SameSiteMode.Strict,
+            Path = "/api/auth", Expires = new DateTimeOffset(expiresAt), IsEssential = true });
+
+    private void ClearCookie() => Response.Cookies.Delete(SessionService.CookieName,
+        new CookieOptions { HttpOnly = true, Secure = !environment.IsDevelopment() && !environment.IsEnvironment("Test") || Request.IsHttps, SameSite = SameSiteMode.Strict, Path = "/api/auth" });
+
+    private IActionResult SessionResponse(SessionResult session, bool setCookie = true)
     {
-        var roles = await _userManager.GetRolesAsync(user);
-        var claims = new List<Claim>
-        {
-            new Claim(JwtRegisteredClaimNames.Sub, user.Id.ToString()),
-            new Claim(JwtRegisteredClaimNames.UniqueName, user.UserName ?? string.Empty),
-            new Claim(JwtRegisteredClaimNames.Email, user.Email ?? string.Empty),
-            new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
-            new Claim(JwtRegisteredClaimNames.Iat, DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(), ClaimValueTypes.Integer64)
-        };
-
-        foreach (var role in roles)
-        {
-            claims.Add(new Claim(ClaimTypes.Role, role));
-        }
-
-        var jwtSection = _configuration.GetSection("Jwt");
-        var secret = jwtSection["Secret"];
-
-        if (string.IsNullOrWhiteSpace(secret))
-        {
-            throw new InvalidOperationException("JWT secret key is not configured");
-        }
-
-        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secret));
-        var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
-
-        var expirationMinutes = jwtSection.GetValue<int>("ExpirationMinutes", 60);
-        var token = new JwtSecurityToken(
-            issuer: jwtSection["Issuer"],
-            audience: jwtSection["Audience"],
-            claims: claims,
-            expires: DateTime.UtcNow.AddMinutes(expirationMinutes),
-            signingCredentials: creds);
-
-        return new JwtSecurityTokenHandler().WriteToken(token);
+        if (setCookie) SetCookie(session.Credential, session.RefreshExpiresAt);
+        Response.Headers.CacheControl = "no-store";
+        return Ok(new { session.Token, session.User, session.ExpiresAt });
     }
 
-    private string GenerateRefreshToken()
-    {
-        var randomNumber = new byte[32];
-        using var rng = RandomNumberGenerator.Create();
-        rng.GetBytes(randomNumber);
-        return Convert.ToBase64String(randomNumber);
-    }
-
-    private async Task<RefreshToken> CreateRefreshTokenAsync(User user)
-    {
-        var refreshToken = new RefreshToken
-        {
-            UserId = user.Id,
-            Token = GenerateRefreshToken(),
-            ExpiresAt = DateTime.UtcNow.AddDays(7), // 7 days expiration
-            CreatedAt = DateTime.UtcNow
-        };
-
-        _dbContext.RefreshTokens.Add(refreshToken);
-        await _dbContext.SaveChangesAsync();
-
-        return refreshToken;
-    }
-
+    [AllowAnonymous, EnableRateLimiting("auth")]
     [HttpPost("register")]
-    public async Task<IActionResult> Register([FromBody] RegisterDto dto)
+    public Task<IActionResult> Register(RegisterDto dto, CancellationToken ct) => RegisterCore(dto, "User", ct);
+
+    [Authorize(Roles = "Admin")]
+    [HttpPost("create-admin")]
+    public Task<IActionResult> CreateAdmin(RegisterDto dto, CancellationToken ct) => RegisterCore(dto, "Admin", ct);
+
+    private async Task<IActionResult> RegisterCore(RegisterDto dto, string role, CancellationToken ct)
     {
-        var startTime = DateTime.UtcNow;
-        try
-        {
-            _logger.LogInformation("Registration attempt for user: {Username}, Email: {Email}", dto.Username, dto.Email);
-
-            // Test database connectivity before proceeding
-            var dbCheckStart = DateTime.UtcNow;
-            try
-            {
-                await _dbContext.Database.CanConnectAsync();
-                var dbCheckTime = DateTime.UtcNow - dbCheckStart;
-                _logger.LogInformation("Database connectivity check completed in {DbCheckTime}ms", dbCheckTime.TotalMilliseconds);
-            }
-            catch (Exception dbEx)
-            {
-                var dbCheckTime = DateTime.UtcNow - dbCheckStart;
-                _logger.LogError(dbEx, "Database connectivity check failed during registration after {DbCheckTime}ms", dbCheckTime.TotalMilliseconds);
-                return StatusCode(500, new { message = "Database temporarily unavailable. Please try again later.", detail = "Database connection failed" });
-            }
-
-            var existingUser = await _userManager.FindByEmailAsync(dto.Email);
-            if (existingUser != null)
-            {
-                _logger.LogWarning("Registration failed: Email {Email} already exists", dto.Email);
-                return BadRequest(new { message = "User with this email already exists" });
-            }
-
-            existingUser = await _userManager.FindByNameAsync(dto.Username);
-            if (existingUser != null)
-            {
-                _logger.LogWarning("Registration failed: Username {Username} already taken", dto.Username);
-                return BadRequest(new { message = "Username is already taken" });
-            }
-
-            var user = new User
-            {
-                UserName = dto.Username,
-                Email = dto.Email,
-                IsPrivate = dto.IsPrivate ?? false,
-                CreatedAt = DateTime.UtcNow,
-            };
-
-            var userCreateStart = DateTime.UtcNow;
-            _logger.LogInformation("Creating user {Username} with Identity", dto.Username);
-            var result = await _userManager.CreateAsync(user, dto.Password);
-            var userCreateTime = DateTime.UtcNow - userCreateStart;
-            _logger.LogInformation("User creation completed in {UserCreateTime}ms", userCreateTime.TotalMilliseconds);
-
-            if (result.Succeeded)
-            {
-                _logger.LogInformation("User {UserId} created successfully in Identity, adding to User role", user.Id);
-
-                // Add user to role with error handling
-                var roleAddStart = DateTime.UtcNow;
-                try
-                {
-                    await _userManager.AddToRoleAsync(user, "User");
-                    var roleAddTime = DateTime.UtcNow - roleAddStart;
-                    _logger.LogInformation("User {UserId} added to User role successfully in {RoleAddTime}ms", user.Id, roleAddTime.TotalMilliseconds);
-                }
-                catch (Exception roleEx)
-                {
-                    var roleAddTime = DateTime.UtcNow - roleAddStart;
-                    _logger.LogError(roleEx, "Failed to add user {UserId} to User role after {RoleAddTime}ms, but registration will continue", user.Id, roleAddTime.TotalMilliseconds);
-                }
-
-                // Sync to MongoDB - this is required for the system to work properly
-                var mongoSyncStart = DateTime.UtcNow;
-                try
-                {
-                    _logger.LogInformation("Syncing user {UserId} to MongoDB", user.Id);
-                    IList<string> roles = await _userManager.GetRolesAsync(user);
-                    List<string> rolesList = roles.ToList();
-                    // Add timeout for MongoDB sync operation
-                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15)); // Reduced from 20 to 15 seconds
-                    await _userSyncService.SyncUserToMongoDbAsync(user, rolesList, cts.Token);
-                    var mongoSyncTime = DateTime.UtcNow - mongoSyncStart;
-                    _logger.LogInformation("User {UserId} synced to MongoDB successfully in {MongoSyncTime}ms", user.Id, mongoSyncTime.TotalMilliseconds);
-                }
-                catch (OperationCanceledException)
-                {
-                    var mongoSyncTime = DateTime.UtcNow - mongoSyncStart;
-                    _logger.LogError("MongoDB sync timeout for user {UserId} during registration after {MongoSyncTime}ms", user.Id, mongoSyncTime.TotalMilliseconds);
-
-                    // MongoDB sync timeout - clean up the Identity user
-                    try
-                    {
-                        await _userManager.DeleteAsync(user);
-                        _logger.LogInformation("Cleaned up Identity user {UserId} due to MongoDB sync timeout", user.Id);
-                    }
-                    catch (Exception cleanupEx)
-                    {
-                        _logger.LogError(cleanupEx, "Failed to clean up Identity user {UserId} after MongoDB sync timeout", user.Id);
-                    }
-
-                    return StatusCode(500, new { message = "User registration failed due to database synchronization timeout. Please try again.", detail = "MongoDB sync operation timed out" });
-                }
-                catch (Exception ex)
-                {
-                    var mongoSyncTime = DateTime.UtcNow - mongoSyncStart;
-                    _logger.LogError(ex, "Failed to sync user {UserId} to MongoDB during registration after {MongoSyncTime}ms", user.Id, mongoSyncTime.TotalMilliseconds);
-
-                    // MongoDB sync failure is critical - we should clean up the Identity user
-                    try
-                    {
-                        await _userManager.DeleteAsync(user);
-                        _logger.LogInformation("Cleaned up Identity user {UserId} due to MongoDB sync failure", user.Id);
-                    }
-                    catch (Exception cleanupEx)
-                    {
-                        _logger.LogError(cleanupEx, "Failed to clean up Identity user {UserId} after MongoDB sync failure", user.Id);
-                    }
-
-                    return StatusCode(500, new { message = "User registration failed due to database synchronization error", detail = ex.Message });
-                }
-
-                var totalTime = DateTime.UtcNow - startTime;
-                _logger.LogInformation("User {UserId} registered successfully in {TotalTime}ms", user.Id, totalTime.TotalMilliseconds);
-                return Ok(new { message = "User registered successfully", userId = user.Id });
-            }
-
-            // Log specific validation errors
-            var errors = result.Errors.Select(e => e.Description).ToList();
-            _logger.LogWarning("User registration failed for {Username}: {Errors}", dto.Username, string.Join(", ", errors));
-            return BadRequest(new { message = "Registration failed", errors = errors });
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Unexpected error during user registration for {Username}: {Error}", dto.Username, ex.Message);
-
-            // Log stack trace for debugging
-            _logger.LogError("Stack trace: {StackTrace}", ex.StackTrace);
-
-            // Check if it's a database-related exception
-            if (ex.Message.Contains("transient") || ex.Message.Contains("connection") || ex.Message.Contains("timeout"))
-            {
-                return StatusCode(500, new { message = "Database temporarily unavailable. Please try again in a moment.", detail = "Transient database error" });
-            }
-
-            return StatusCode(500, new { message = "An error occurred during registration", detail = ex.Message });
-        }
+        if (!BrowserRequestAllowed()) return StatusCode(403, new { message = "Untrusted request origin or missing request header" });
+        if (await users.FindByNameAsync(dto.Username.Trim()) != null || await users.FindByEmailAsync(dto.Email.Trim()) != null)
+            return Conflict(new { message = "Username or email is already registered" });
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        var user = new User { UserName = dto.Username.Trim(), Email = dto.Email.Trim(), IsPrivate = dto.IsPrivate ?? false,
+            CreatedAt = clock.GetUtcNow().UtcDateTime, LockoutEnabled = true };
+        var result = await users.CreateAsync(user, dto.Password);
+        if (!result.Succeeded) return BadRequest(new { message = "Account could not be created", errors = result.Errors.Select(e => e.Description) });
+        result = await users.AddToRoleAsync(user, role);
+        if (!result.Succeeded) return BadRequest(new { message = "Account role could not be assigned" });
+        await profiles.EnqueueAsync(user.Id, ct: ct);
+        await tx.CommitAsync(ct);
+        if (!await profiles.ReconcileAsync(user.Id, ct)) return StatusCode(503, new { message = "Your account was created; profile setup is pending. Retry login shortly.", userId = user.Id, pending = true });
+        return Ok(new { message = "Account created", userId = user.Id });
     }
 
+    [AllowAnonymous, EnableRateLimiting("auth")]
     [HttpPost("login")]
-    public async Task<IActionResult> Login([FromBody] LoginDto dto)
+    public async Task<IActionResult> Login(LoginDto dto, CancellationToken ct)
     {
-        try
-        {
-            var user = await _userManager.FindByNameAsync(dto.Username);
-            if (user == null)
-            {
-                return BadRequest(new { message = "Invalid credentials" });
-            }
-
-            var result = await _signInManager.CheckPasswordSignInAsync(user, dto.Password, lockoutOnFailure: true);
-
-            if (result.IsLockedOut)
-            {
-                var lockoutEnd = await _userManager.GetLockoutEndDateAsync(user);
-                return BadRequest(new { message = $"Account locked until {lockoutEnd}" });
-            }
-
-            if (!result.Succeeded)
-            {
-                return BadRequest(new { message = "Invalid credentials" });
-            }
-
-            var jwtToken = await GenerateJwtTokenAsync(user);
-            var refreshToken = await CreateRefreshTokenAsync(user);
-            var roles = await _userManager.GetRolesAsync(user);
-
-            _logger.LogInformation("User {UserId} logged in successfully", user.Id);
-
-            return Ok(new
-            {
-                message = "Login successful",
-                token = jwtToken,
-                refreshToken = refreshToken.Token,
-                user = new
-                {
-                    id = user.Id,
-                    username = user.UserName,
-                    email = user.Email,
-                    isPrivate = user.IsPrivate,
-                    createdAt = user.CreatedAt,
-                    roles = roles
-                }
-            });
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error during user login");
-            return StatusCode(500, new { message = "An error occurred during login" });
-        }
+        if (!BrowserRequestAllowed()) return StatusCode(403, new { message = "Untrusted request origin or missing request header" });
+        var user = await users.FindByNameAsync(dto.Username.Trim()) ?? await users.FindByEmailAsync(dto.Username.Trim());
+        if (user == null || user.IsDeleted) return Unauthorized(new { message = "Invalid username or password" });
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        await LockAccount(user, ct);
+        if (user.IsDeleted) return Unauthorized(new { message = "Invalid username or password" });
+        var checkedPassword = await signIn.CheckPasswordSignInAsync(user, dto.Password, lockoutOnFailure: true);
+        if (!checkedPassword.Succeeded) { await tx.CommitAsync(ct); return Unauthorized(new { message = "Invalid username or password, or account temporarily locked" }); }
+        // Idempotent repair also covers a profile removed outside normal application paths.
+        await profiles.EnqueueAsync(user.Id, ct: ct);
+        if (!await profiles.ReconcileAsync(user.Id, ct)) { await tx.CommitAsync(ct); return StatusCode(503, new { message = "Profile setup is pending. Retry login shortly." }); }
+        if (Request.Cookies.TryGetValue(SessionService.CookieName, out var old)) await sessions.RevokeCredentialAsync(old, ct);
+        var session = await sessions.CreateAsync(user, ct: ct);
+        await tx.CommitAsync(ct);
+        return SessionResponse(session);
     }
 
-    [Authorize]
-    [HttpPost("logout")]
-    public async Task<IActionResult> Logout()
-    {
-        await _signInManager.SignOutAsync();
-        return Ok(new { message = "Logged out successfully" });
-    }
-
-    [Authorize]
-    [HttpGet("me")]
-    public async Task<IActionResult> GetCurrentUser()
-    {
-        try
-        {
-            var userId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
-            if (string.IsNullOrEmpty(userId))
-            {
-                return Unauthorized();
-            }
-
-            var user = await _userManager.FindByIdAsync(userId);
-            if (user == null)
-            {
-                return NotFound();
-            }
-
-            var roles = await _userManager.GetRolesAsync(user);
-
-            return Ok(new
-            {
-                id = user.Id,
-                username = user.UserName,
-                email = user.Email,
-                isPrivate = user.IsPrivate,
-                createdAt = user.CreatedAt,
-                roles = roles
-            });
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error getting current user");
-            return StatusCode(500, new { message = "An error occurred" });
-        }
-    }
-
-    [Authorize]
-    [HttpPut("me")]
-    public async Task<IActionResult> UpdateCurrentUser([FromBody] UpdateUserDto dto)
-    {
-        try
-        {
-            var userId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
-            if (string.IsNullOrEmpty(userId))
-            {
-                return Unauthorized();
-            }
-
-            var user = await _userManager.FindByIdAsync(userId);
-            if (user == null)
-            {
-                return NotFound();
-            }
-
-            if (!string.IsNullOrEmpty(dto.Email) && dto.Email != user.Email)
-            {
-                var existingUser = await _userManager.FindByEmailAsync(dto.Email);
-                if (existingUser != null && existingUser.Id != user.Id)
-                {
-                    return BadRequest(new { message = "Email is already in use" });
-                }
-                user.Email = dto.Email;
-            }
-
-            if (dto.IsPrivate.HasValue)
-            {
-                user.IsPrivate = dto.IsPrivate.Value;
-            }
-
-            var result = await _userManager.UpdateAsync(user);
-            if (result.Succeeded)
-            {
-                try
-                {
-                    IList<string> roles = await _userManager.GetRolesAsync(user);
-                    List<string> rolesList = roles.ToList();
-                    await _userSyncService.UpdateUserInMongoDbAsync(user, rolesList);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Failed to sync user {UserId} to MongoDB during update", user.Id);
-                }
-
-                _logger.LogInformation("User {UserId} updated successfully", user.Id);
-                return Ok(new { message = "User updated successfully" });
-            }
-
-            return BadRequest(new { message = "Update failed", errors = result.Errors.Select(e => e.Description) });
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error updating user");
-            return StatusCode(500, new { message = "An error occurred during update" });
-        }
-    }
-
-    [Authorize]
-    [HttpPost("change-password")]
-    public async Task<IActionResult> ChangePassword([FromBody] ChangePasswordDto dto)
-    {
-        try
-        {
-            var userId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
-            if (string.IsNullOrEmpty(userId))
-            {
-                return Unauthorized();
-            }
-
-            var user = await _userManager.FindByIdAsync(userId);
-            if (user == null)
-            {
-                return NotFound();
-            }
-
-            var result = await _userManager.ChangePasswordAsync(user, dto.CurrentPassword, dto.NewPassword);
-            if (result.Succeeded)
-            {
-                _logger.LogInformation("User {UserId} changed password successfully", user.Id);
-                return Ok(new { message = "Password changed successfully" });
-            }
-
-            return BadRequest(new { message = "Password change failed", errors = result.Errors.Select(e => e.Description) });
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error changing password");
-            return StatusCode(500, new { message = "An error occurred during password change" });
-        }
-    }
-
-    [HttpPost("users/{id}/roles/{role}")]
-    public async Task<IActionResult> AssignRole(Guid id, string role)
-    {
-        try
-        {
-            var user = await _userManager.FindByIdAsync(id.ToString());
-            if (user == null)
-            {
-                return NotFound("User not found");
-            }
-
-            if (!await _roleManager.RoleExistsAsync(role))
-            {
-                return BadRequest("Role does not exist");
-            }
-
-            if (await _userManager.IsInRoleAsync(user, role))
-            {
-                return BadRequest("User already has this role");
-            }
-
-            var result = await _userManager.AddToRoleAsync(user, role);
-            if (result.Succeeded)
-            {
-                _logger.LogInformation("Role {Role} assigned to user {UserId}", role, user.Id);
-                return Ok(new { message = $"Role '{role}' assigned successfully" });
-            }
-
-            return BadRequest(new { message = "Role assignment failed", errors = result.Errors.Select(e => e.Description) });
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error assigning role");
-            return StatusCode(500, new { message = "An error occurred during role assignment" });
-        }
-    }
-
-    [Authorize]
-    [HttpGet("users/{id}")]
-    public async Task<IActionResult> GetUser(Guid id)
-    {
-        try
-        {
-            var user = await _userManager.FindByIdAsync(id.ToString());
-            if (user == null)
-            {
-                return NotFound();
-            }
-
-            var roles = await _userManager.GetRolesAsync(user);
-
-            return Ok(new
-            {
-                id = user.Id,
-                username = user.UserName,
-                email = user.Email,
-                isPrivate = user.IsPrivate,
-                createdAt = user.CreatedAt,
-                roles = roles
-            });
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error getting user {UserId}", id);
-            return StatusCode(500, new { message = "An error occurred while retrieving user" });
-        }
-    }
-
-    [HttpPut("users/{id}")]
-    public async Task<IActionResult> UpdateUser(Guid id, [FromBody] UpdateUserDto dto)
-    {
-        try
-        {
-            var user = await _userManager.FindByIdAsync(id.ToString());
-            if (user == null)
-            {
-                return NotFound();
-            }
-
-            if (!string.IsNullOrEmpty(dto.Email) && dto.Email != user.Email)
-            {
-                var existingUser = await _userManager.FindByEmailAsync(dto.Email);
-                if (existingUser != null && existingUser.Id != user.Id)
-                {
-                    return BadRequest(new { message = "Email is already in use" });
-                }
-                user.Email = dto.Email;
-            }
-
-            if (dto.IsPrivate.HasValue)
-            {
-                user.IsPrivate = dto.IsPrivate.Value;
-            }
-
-            var result = await _userManager.UpdateAsync(user);
-            if (result.Succeeded)
-            {
-                try
-                {
-                    IList<string> roles = await _userManager.GetRolesAsync(user);
-                    List<string> rolesList = roles.ToList();
-                    await _userSyncService.UpdateUserInMongoDbAsync(user, rolesList);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Failed to sync user {UserId} to MongoDB during admin update", user.Id);
-                }
-
-                _logger.LogInformation("User {UserId} updated successfully by admin", user.Id);
-                return Ok(new { message = "User updated successfully" });
-            }
-
-            return BadRequest(new { message = "Update failed", errors = result.Errors.Select(e => e.Description) });
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error updating user {UserId}", id);
-            return StatusCode(500, new { message = "An error occurred during update" });
-        }
-    }
-
-    [Authorize]
+    [AllowAnonymous, EnableRateLimiting("auth")]
     [HttpPost("refresh")]
-    public async Task<IActionResult> RefreshToken([FromBody] RefreshTokenDto dto)
+    public async Task<IActionResult> Refresh(CancellationToken ct)
     {
-        try
-        {
-            var refreshToken = await _dbContext.RefreshTokens
-                .Include(rt => rt.User)
-                .FirstOrDefaultAsync(rt => rt.Token == dto.RefreshToken);
-
-            if (refreshToken == null || refreshToken.IsRevoked || refreshToken.ExpiresAt <= DateTime.UtcNow)
-            {
-                return BadRequest(new { message = "Invalid or expired refresh token" });
-            }
-
-            var user = refreshToken.User;
-            var jwtToken = await GenerateJwtTokenAsync(user);
-            var newRefreshToken = await CreateRefreshTokenAsync(user);
-
-            refreshToken.IsRevoked = true;
-            await _dbContext.SaveChangesAsync();
-
-            _logger.LogInformation("Token refreshed for user {UserId}", user.Id);
-
-            return Ok(new
-            {
-                message = "Token refreshed successfully",
-                token = jwtToken,
-                refreshToken = newRefreshToken.Token
-            });
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error refreshing token");
-            return StatusCode(500, new { message = "An error occurred during token refresh" });
-        }
+        if (!BrowserRequestAllowed()) return StatusCode(403, new { message = "Untrusted request origin or missing request header" });
+        if (!Request.Cookies.TryGetValue(SessionService.CookieName, out var credential)) return Unauthorized(new { message = "Refresh session missing" });
+        var result = await sessions.RotateAsync(credential, ct);
+        if (result == null) { ClearCookie(); return Unauthorized(new { message = "Refresh session expired, revoked, or replayed" }); }
+        return SessionResponse(result);
     }
 
-    [Authorize]
-    [HttpPost("revoke")]
-    public async Task<IActionResult> RevokeRefreshToken([FromBody] RefreshTokenDto dto)
+    [AllowAnonymous, EnableRateLimiting("auth")]
+    [HttpPost("refresh/prepare")]
+    public async Task<IActionResult> PrepareRefresh(CancellationToken ct)
     {
-        try
-        {
-            var refreshToken = await _dbContext.RefreshTokens
-                .FirstOrDefaultAsync(rt => rt.Token == dto.RefreshToken);
-
-            if (refreshToken == null)
-            {
-                return BadRequest(new { message = "Invalid refresh token" });
-            }
-
-            refreshToken.IsRevoked = true;
-            await _dbContext.SaveChangesAsync();
-
-            _logger.LogInformation("Refresh token revoked for user {UserId}", refreshToken.UserId);
-
-            return Ok(new { message = "Refresh token revoked successfully" });
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error revoking refresh token");
-            return StatusCode(500, new { message = "An error occurred during token revocation" });
-        }
+        if (!BrowserRequestAllowed()) return StatusCode(403, new { message = "Untrusted request origin or missing request header" });
+        if (!Request.Cookies.TryGetValue(SessionService.CookieName, out var credential)) return Unauthorized();
+        var result = await sessions.PrepareAsync(credential, Request.Headers["X-Spotibuds-Refresh-Request"].ToString(), ct);
+        if (result == null) { ClearCookie(); return Unauthorized(new { message = "Refresh preparation expired, revoked, or invalid" }); }
+        SetCookie(result.Credential, result.RefreshExpiresAt);
+        Response.Headers.CacheControl = "no-store";
+        return NoContent();
     }
 
-    [Authorize]
-    [HttpGet("users/search")]
-    public async Task<IActionResult> SearchUsers([FromQuery] string username, [FromQuery] int page = 1, [FromQuery] int pageSize = 10)
+    [AllowAnonymous, EnableRateLimiting("auth")]
+    [HttpPost("refresh/complete")]
+    public async Task<IActionResult> CompleteRefresh(CancellationToken ct)
     {
-        try
-        {
-            if (string.IsNullOrWhiteSpace(username))
-            {
-                return BadRequest("Username parameter is required");
-            }
-
-            if (pageSize > 50)
-            {
-                pageSize = 50;
-            }
-
-            var users = await _userManager.Users
-                .Where(u => u.UserName!.Contains(username))
-                .Skip((page - 1) * pageSize)
-                .Take(pageSize)
-                .Select(u => new
-                {
-                    id = u.Id,
-                    username = u.UserName,
-                    isPrivate = u.IsPrivate
-                })
-                .ToListAsync();
-
-            return Ok(new { users, page, pageSize });
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error searching users");
-            return StatusCode(500, new { message = "An error occurred during search" });
-        }
+        if (!BrowserRequestAllowed()) return StatusCode(403, new { message = "Untrusted request origin or missing request header" });
+        if (!Request.Cookies.TryGetValue(SessionService.CookieName, out var credential)) return Unauthorized();
+        var result = await sessions.CompleteAsync(credential, Request.Headers["X-Spotibuds-Refresh-Request"].ToString(), ct);
+        if (result == null) { ClearCookie(); return Unauthorized(new { message = "Refresh completion expired, revoked, or invalid" }); }
+        return SessionResponse(result, setCookie: false);
     }
 
-    [HttpGet("test-connection")]
-    public async Task<IActionResult> TestDatabaseConnection()
+    [AllowAnonymous]
+    [HttpPost("logout"), HttpPost("revoke")]
+    public async Task<IActionResult> Logout(CancellationToken ct)
     {
-        try
-        {
-            var connectionString = _configuration.GetConnectionString("DefaultConnection");
-            _logger.LogInformation("Testing connection with: {ConnectionString}", connectionString?.Substring(0, Math.Min(50, connectionString?.Length ?? 0)) + "...");
+        if (!BrowserRequestAllowed()) return StatusCode(403, new { message = "Untrusted request origin or missing request header" });
+        if (Request.Cookies.TryGetValue(SessionService.CookieName, out var credential)) await sessions.RevokeCredentialAsync(credential, ct);
+        ClearCookie();
+        return NoContent();
+    }
 
-            // Test database context
-            var canConnect = await _dbContext.Database.CanConnectAsync();
+    [HttpGet("me")]
+    public async Task<IActionResult> Me()
+    {
+        var user = await users.FindByIdAsync(Actor.ToString());
+        if (user == null || user.IsDeleted) return Unauthorized();
+        return Ok(new SessionUser(user.Id, user.UserName!, user.Email!, user.IsPrivate, (await users.GetRolesAsync(user)).ToArray()));
+    }
 
-            // Test MongoDB connection
-            var mongoConnectionString = _configuration.GetConnectionString("MongoDb");
+    [HttpPut("me")]
+    public Task<IActionResult> UpdateMe(UpdateUserDto dto, CancellationToken ct) => UpdateAccount(Actor, dto, ct);
 
-            return Ok(new
-            {
-                timestamp = DateTime.UtcNow,
-                postgresql = new
-                {
-                    connectionString = connectionString?.Substring(0, Math.Min(50, connectionString?.Length ?? 0)) + "...",
-                    entityFrameworkConnection = canConnect
-                },
-                mongodb = new
-                {
-                    connectionString = mongoConnectionString?.Substring(0, Math.Min(50, mongoConnectionString?.Length ?? 0)) + "...",
-                    configured = !string.IsNullOrEmpty(mongoConnectionString)
-                }
-            });
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error testing connections");
-            return StatusCode(500, new
-            {
-                message = "Connection test failed",
-                error = ex.Message,
-                stackTrace = ex.StackTrace?.Substring(0, Math.Min(500, ex.StackTrace?.Length ?? 0))
-            });
-        }
+    [Authorize(Roles = "Admin")]
+    [HttpPut("users/{id:guid}")]
+    public Task<IActionResult> UpdateUser(Guid id, UpdateUserDto dto, CancellationToken ct) => UpdateAccount(id, dto, ct);
+
+    private async Task<IActionResult> UpdateAccount(Guid id, UpdateUserDto dto, CancellationToken ct)
+    {
+        var user = await users.FindByIdAsync(id.ToString());
+        if (user == null || user.IsDeleted) return NotFound();
+        // External email verification is outside this local demo. An email change is intentionally unavailable.
+        if (dto.Email != null && !StringComparer.OrdinalIgnoreCase.Equals(dto.Email.Trim(), user.Email))
+            return BadRequest(new { message = "Email changes require verification and are unavailable in the local demo" });
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        await LockAccount(user, ct);
+        if (user.IsDeleted) return NotFound();
+        if (dto.IsPrivate.HasValue) user.IsPrivate = dto.IsPrivate.Value;
+        var result = await users.UpdateAsync(user);
+        if (!result.Succeeded) return BadRequest(new { message = "Account update failed", errors = result.Errors.Select(e => e.Description) });
+        await profiles.EnqueueAsync(id, ct: ct);
+        await tx.CommitAsync(ct);
+        if (!await profiles.ReconcileAsync(id, ct)) return StatusCode(503, new { message = "Account updated; profile synchronization is pending", pending = true });
+        return Ok(new { message = "Account updated" });
+    }
+
+    [HttpPost("change-password")]
+    public async Task<IActionResult> ChangePassword(ChangePasswordDto dto, CancellationToken ct)
+    {
+        var user = await users.FindByIdAsync(Actor.ToString());
+        if (user == null) return Unauthorized();
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        await LockAccount(user, ct);
+        var result = await users.ChangePasswordAsync(user, dto.CurrentPassword, dto.NewPassword);
+        if (!result.Succeeded) return BadRequest(new { message = "Password change failed", errors = result.Errors.Select(e => e.Description) });
+        await sessions.RevokeUserAsync(user.Id, ct);
+        await db.PasswordResets.Where(t => t.UserId == user.Id && !t.Used).ExecuteUpdateAsync(s => s.SetProperty(t => t.Used, true), ct);
+        await tx.CommitAsync(ct);
+        ClearCookie();
+        return Ok(new { message = "Password changed. Sign in again." });
     }
 
     [Authorize(Roles = "Admin")]
-    [HttpDelete("users/{id}")]
-    public async Task<IActionResult> DeleteUser(Guid id)
+    [HttpPost("users/{id:guid}/roles/{role}")]
+    public Task<IActionResult> AssignRole(Guid id, string role, CancellationToken ct) => ChangeRole(id, role, ct);
+    [Authorize(Roles = "Admin")]
+    [HttpPost("users/{id:guid}/promote-to-admin")]
+    public Task<IActionResult> Promote(Guid id, CancellationToken ct) => ChangeRole(id, "Admin", ct);
+    [Authorize(Roles = "Admin")]
+    [HttpPost("users/{id:guid}/demote-to-user")]
+    public Task<IActionResult> Demote(Guid id, CancellationToken ct) => ChangeRole(id, "User", ct);
+
+    private async Task<IActionResult> ChangeRole(Guid id, string role, CancellationToken ct)
     {
-        try
-        {
-            var user = await _userManager.FindByIdAsync(id.ToString());
-            if (user == null)
-            {
-                return NotFound(new { message = "User not found" });
-            }
+        if (role is not ("Admin" or "Musician" or "User") || !await roles.RoleExistsAsync(role)) return BadRequest(new { message = "Unknown role" });
+        if (id == Actor && role != "Admin") return Conflict(new { message = "Administrators cannot demote themselves" });
+        var user = await users.FindByIdAsync(id.ToString());
+        if (user == null || user.IsDeleted) return NotFound();
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        await LockAccount(user, ct);
+        if (user.IsDeleted) return NotFound();
+        var current = await users.GetRolesAsync(user);
+        var remove = await users.RemoveFromRolesAsync(user, current);
+        var add = remove.Succeeded ? await users.AddToRoleAsync(user, role) : remove;
+        if (!add.Succeeded) return BadRequest(new { message = "Role change failed" });
+        await sessions.RevokeUserAsync(id, ct);
+        await profiles.EnqueueAsync(id, ct: ct);
+        await tx.CommitAsync(ct);
+        if (!await profiles.ReconcileAsync(id, ct)) return StatusCode(503, new { message = "Role changed; profile synchronization is pending", pending = true });
+        return Ok(new { message = "Role changed. The account must sign in again." });
+    }
 
-            var result = await _userManager.DeleteAsync(user);
-            if (result.Succeeded)
-            {
-                _logger.LogInformation("User {UserId} deleted successfully", id);
+    [HttpGet("users/{id:guid}")]
+    public async Task<IActionResult> GetUser(Guid id)
+    {
+        if (id != Actor && !User.IsInRole("Admin")) return Forbid();
+        var user = await users.FindByIdAsync(id.ToString());
+        return user == null || user.IsDeleted ? NotFound() : Ok(await UserContract(user));
+    }
 
-                try
-                {
-                    await _userSyncService.DeleteUserFromMongoDbAsync(user.Id.ToString());
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Failed to remove user {UserId} from MongoDB", user.Id);
-                }
-
-                return Ok(new { message = "User deleted successfully" });
-            }
-
-            return BadRequest(new { message = "User deletion failed", errors = result.Errors.Select(e => e.Description) });
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error deleting user {UserId}", id);
-            return StatusCode(500, new { message = "An error occurred during deletion" });
-        }
+    [Authorize(Roles = "Admin")]
+    [HttpDelete("users/{id:guid}")]
+    public async Task<IActionResult> DeleteUser(Guid id, CancellationToken ct)
+    {
+        if (id == Actor) return Conflict(new { message = "Administrators cannot delete themselves" });
+        var user = await users.FindByIdAsync(id.ToString());
+        if (user == null) return NoContent();
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        await LockAccount(user, ct);
+        user.IsDeleted = true;
+        await db.SaveChangesAsync(ct);
+        await sessions.RevokeUserAsync(id, ct);
+        await profiles.EnqueueAsync(id, delete: true, ct);
+        await tx.CommitAsync(ct);
+        if (!await profiles.ReconcileAsync(id, ct)) return Accepted(new { message = "Account disabled; cleanup is pending", pending = true });
+        return NoContent();
     }
 
     [Authorize(Roles = "Admin")]
     [HttpGet("users")]
-    public async Task<IActionResult> GetAllUsers()
-    {
-        try
-        {
-            var users = await _userManager.Users.ToListAsync();
-            var userList = new List<object>();
-
-            foreach (var user in users)
-            {
-                var roles = await _userManager.GetRolesAsync(user);
-                if (roles.Contains("User"))
-                {
-                    userList.Add(new
-                    {
-                        Id = user.Id,
-                        UserName = user.UserName,
-                        Email = user.Email,
-                        IsPrivate = user.IsPrivate,
-                        CreatedAt = user.CreatedAt,
-                        Roles = roles
-                    });
-                }
-            }
-
-            return Ok(userList);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error getting all users");
-            return StatusCode(500, "Internal server error");
-        }
-    }
-
+    public Task<IActionResult> AllUsers(int page = 1, int pageSize = 50, CancellationToken ct = default) => ListUsers(null, page, pageSize, ct);
     [Authorize(Roles = "Admin")]
     [HttpGet("admins")]
-    public async Task<IActionResult> GetAllAdmins()
+    public Task<IActionResult> Admins(int page = 1, int pageSize = 50, CancellationToken ct = default) => ListUsers("Admin", page, pageSize, ct);
+
+    private async Task<IActionResult> ListUsers(string? role, int page, int pageSize, CancellationToken ct)
     {
-        try
-        {
-            var users = await _userManager.Users.ToListAsync();
-            var adminList = new List<object>();
-
-            foreach (var user in users)
-            {
-                var roles = await _userManager.GetRolesAsync(user);
-                if (roles.Contains("Admin"))
-                {
-                    adminList.Add(new
-                    {
-                        Id = user.Id,
-                        UserName = user.UserName,
-                        Email = user.Email,
-                        IsPrivate = user.IsPrivate,
-                        CreatedAt = user.CreatedAt,
-                        Roles = roles
-                    });
-                }
-            }
-
-            return Ok(adminList);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error getting all admins");
-            return StatusCode(500, "Internal server error");
-        }
+        if (page < 1 || page > 10000 || pageSize < 1 || pageSize > 100) return BadRequest(new { message = "Invalid pagination" });
+        var query = db.Users.Where(u => !u.IsDeleted);
+        if (role != null) query = query.Where(u => db.UserRoles.Any(ur => ur.UserId == u.Id && db.Roles.Any(r => r.Id == ur.RoleId && r.Name == role)));
+        var count = await query.CountAsync(ct);
+        var found = await query.OrderBy(u => u.UserName).Skip((page - 1) * pageSize).Take(pageSize).ToListAsync(ct);
+        var ids = found.Select(u => u.Id).ToList();
+        var assignments = await (from ur in db.UserRoles join r in db.Roles on ur.RoleId equals r.Id where ids.Contains(ur.UserId) select new { ur.UserId, r.Name }).ToListAsync(ct);
+        return Ok(new { users = found.Select(u => new { u.Id, username = u.UserName, u.Email, u.IsPrivate, u.CreatedAt,
+            roles = assignments.Where(a => a.UserId == u.Id).Select(a => a.Name).ToArray() }), totalCount = count, page, pageSize });
     }
 
-    [Authorize(Roles = "Admin")]
-    [HttpPost("create-admin")]
-    public async Task<IActionResult> CreateAdmin([FromBody] RegisterDto dto)
+    [HttpGet("users/search")]
+    public async Task<IActionResult> Search(string username = "", int page = 1, int pageSize = 10, CancellationToken ct = default)
     {
-        var startTime = DateTime.UtcNow;
-        try
-        {
-            _logger.LogInformation("Registration attempt for user: {Username}, Email: {Email}", dto.Username, dto.Email);
-
-            // Test database connectivity before proceeding
-            var dbCheckStart = DateTime.UtcNow;
-            try
-            {
-                await _dbContext.Database.CanConnectAsync();
-                var dbCheckTime = DateTime.UtcNow - dbCheckStart;
-                _logger.LogInformation("Database connectivity check completed in {DbCheckTime}ms", dbCheckTime.TotalMilliseconds);
-            }
-            catch (Exception dbEx)
-            {
-                var dbCheckTime = DateTime.UtcNow - dbCheckStart;
-                _logger.LogError(dbEx, "Database connectivity check failed during registration after {DbCheckTime}ms", dbCheckTime.TotalMilliseconds);
-                return StatusCode(500, new { message = "Database temporarily unavailable. Please try again later.", detail = "Database connection failed" });
-            }
-
-            var existingUser = await _userManager.FindByEmailAsync(dto.Email);
-            if (existingUser != null)
-            {
-                _logger.LogWarning("Registration failed: Email {Email} already exists", dto.Email);
-                return BadRequest(new { message = "User with this email already exists" });
-            }
-
-            existingUser = await _userManager.FindByNameAsync(dto.Username);
-            if (existingUser != null)
-            {
-                _logger.LogWarning("Registration failed: Username {Username} already taken", dto.Username);
-                return BadRequest(new { message = "Username is already taken" });
-            }
-
-            var user = new User
-            {
-                UserName = dto.Username,
-                Email = dto.Email,
-                IsPrivate = dto.IsPrivate ?? false,
-                CreatedAt = DateTime.UtcNow,
-            };
-
-            var userCreateStart = DateTime.UtcNow;
-            _logger.LogInformation("Creating user {Username} with Identity", dto.Username);
-            var result = await _userManager.CreateAsync(user, dto.Password);
-            var userCreateTime = DateTime.UtcNow - userCreateStart;
-            _logger.LogInformation("User creation completed in {UserCreateTime}ms", userCreateTime.TotalMilliseconds);
-
-            if (result.Succeeded)
-            {
-                _logger.LogInformation("User {UserId} created successfully in Identity, adding to User role", user.Id);
-
-                // Add user to role with error handling
-                var roleAddStart = DateTime.UtcNow;
-                try
-                {
-                    await _userManager.AddToRoleAsync(user, "Admin");
-                    var roleAddTime = DateTime.UtcNow - roleAddStart;
-                    _logger.LogInformation("User {UserId} added to User role successfully in {RoleAddTime}ms", user.Id, roleAddTime.TotalMilliseconds);
-                }
-                catch (Exception roleEx)
-                {
-                    var roleAddTime = DateTime.UtcNow - roleAddStart;
-                    _logger.LogError(roleEx, "Failed to add user {UserId} to User role after {RoleAddTime}ms, but registration will continue", user.Id, roleAddTime.TotalMilliseconds);
-                }
-
-                // Sync to MongoDB - this is required for the system to work properly
-                var mongoSyncStart = DateTime.UtcNow;
-                try
-                {
-                    _logger.LogInformation("Syncing user {UserId} to MongoDB", user.Id);
-                    IList<string> roles = await _userManager.GetRolesAsync(user);
-                    List<string> rolesList = roles.ToList();
-                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15)); // Reduced from 20 to 15 seconds
-                    await _userSyncService.SyncUserToMongoDbAsync(user, rolesList, cts.Token);
-                    var mongoSyncTime = DateTime.UtcNow - mongoSyncStart;
-                    _logger.LogInformation("User {UserId} synced to MongoDB successfully in {MongoSyncTime}ms", user.Id, mongoSyncTime.TotalMilliseconds);
-                }
-                catch (OperationCanceledException)
-                {
-                    var mongoSyncTime = DateTime.UtcNow - mongoSyncStart;
-                    _logger.LogError("MongoDB sync timeout for user {UserId} during registration after {MongoSyncTime}ms", user.Id, mongoSyncTime.TotalMilliseconds);
-
-                    // MongoDB sync timeout - clean up the Identity user
-                    try
-                    {
-                        await _userManager.DeleteAsync(user);
-                        _logger.LogInformation("Cleaned up Identity user {UserId} due to MongoDB sync timeout", user.Id);
-                    }
-                    catch (Exception cleanupEx)
-                    {
-                        _logger.LogError(cleanupEx, "Failed to clean up Identity user {UserId} after MongoDB sync timeout", user.Id);
-                    }
-
-                    return StatusCode(500, new { message = "User registration failed due to database synchronization timeout. Please try again.", detail = "MongoDB sync operation timed out" });
-                }
-                catch (Exception ex)
-                {
-                    var mongoSyncTime = DateTime.UtcNow - mongoSyncStart;
-                    _logger.LogError(ex, "Failed to sync user {UserId} to MongoDB during registration after {MongoSyncTime}ms", user.Id, mongoSyncTime.TotalMilliseconds);
-
-                    // MongoDB sync failure is critical - we should clean up the Identity user
-                    try
-                    {
-                        await _userManager.DeleteAsync(user);
-                        _logger.LogInformation("Cleaned up Identity user {UserId} due to MongoDB sync failure", user.Id);
-                    }
-                    catch (Exception cleanupEx)
-                    {
-                        _logger.LogError(cleanupEx, "Failed to clean up Identity user {UserId} after MongoDB sync failure", user.Id);
-                    }
-
-                    return StatusCode(500, new { message = "User registration failed due to database synchronization error", detail = ex.Message });
-                }
-
-                var totalTime = DateTime.UtcNow - startTime;
-                _logger.LogInformation("User {UserId} registered successfully in {TotalTime}ms", user.Id, totalTime.TotalMilliseconds);
-                return Ok(new { message = "User registered successfully", userId = user.Id });
-            }
-
-            // Log specific validation errors
-            var errors = result.Errors.Select(e => e.Description).ToList();
-            _logger.LogWarning("User registration failed for {Username}: {Errors}", dto.Username, string.Join(", ", errors));
-            return BadRequest(new { message = "Registration failed", errors = errors });
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Unexpected error during user registration for {Username}: {Error}", dto.Username, ex.Message);
-
-            // Log stack trace for debugging
-            _logger.LogError("Stack trace: {StackTrace}", ex.StackTrace);
-
-            // Check if it's a database-related exception
-            if (ex.Message.Contains("transient") || ex.Message.Contains("connection") || ex.Message.Contains("timeout"))
-            {
-                return StatusCode(500, new { message = "Database temporarily unavailable. Please try again in a moment.", detail = "Transient database error" });
-            }
-
-            return StatusCode(500, new { message = "An error occurred during registration", detail = ex.Message });
-        }
+        if (username.Length > 50 || page < 1 || page > 1000 || pageSize is < 1 or > 50) return BadRequest(new { message = "Invalid search or pagination" });
+        if (string.IsNullOrWhiteSpace(username)) return Ok(new { users = Array.Empty<object>(), page, pageSize });
+        var found = await db.Users.Where(u => !u.IsDeleted && (!u.IsPrivate || u.Id == Actor) && u.UserName!.Contains(username))
+            .OrderBy(u => u.UserName).Skip((page - 1) * pageSize).Take(pageSize).Select(u => new { u.Id, username = u.UserName, u.IsPrivate }).ToListAsync(ct);
+        return Ok(new { users = found, page, pageSize });
     }
 
-    [Authorize(Roles = "Admin")]
-    [HttpPost("users/{id}/promote-to-admin")]
-    public async Task<IActionResult> PromoteToAdmin(Guid id)
+    [AllowAnonymous, EnableRateLimiting("auth")]
+    [HttpPost("forgot-password")]
+    public async Task<IActionResult> Forgot(ForgotPasswordDto dto, CancellationToken ct)
     {
-        try
+        if (!BrowserRequestAllowed()) return StatusCode(403, new { message = "Untrusted request origin or missing request header" });
+        // Check the local sink for both known and unknown addresses, so an outage does not enumerate accounts.
+        await mailer.CheckAvailableAsync(ct);
+        var user = await users.FindByEmailAsync(dto.Email.Trim());
+        if (user != null && !user.IsDeleted)
         {
-            var user = await _userManager.FindByIdAsync(id.ToString());
-            if (user == null)
-            {
-                return NotFound(new { message = "User not found" });
-            }
-
-            var isAdmin = await _userManager.IsInRoleAsync(user, "Admin");
-            if (isAdmin)
-            {
-                return BadRequest(new { message = "User is already an admin" });
-            }
-
-            var roleExists = await _roleManager.RoleExistsAsync("Admin");
-            if (!roleExists)
-            {
-                return BadRequest(new { message = "Admin role does not exist" });
-            }
-
-            await _userManager.RemoveFromRoleAsync(user, "User");
-            var result = await _userManager.AddToRoleAsync(user, "Admin");
-
-            if (!result.Succeeded)
-            {
-                return BadRequest(new { message = "Failed to promote user", errors = result.Errors.Select(e => e.Description) });
-            }
-
-            try
-            {
-                var roles = await _userManager.GetRolesAsync(user);
-                await _userSyncService.UpdateUserInMongoDbAsync(user, roles.ToList());
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to sync promoted admin user {UserId} to MongoDB", user.Id);
-            }
-
-            _logger.LogInformation("User {UserId} promoted to admin successfully", user.Id);
-            return Ok(new { message = "User promoted to admin successfully" });
+            await using var tx = await db.Database.BeginTransactionAsync(ct);
+            await LockAccount(user, ct);
+            if (user.IsDeleted) return Ok(new { message = RecoveryMessage });
+            var credential = SessionService.NewCredential();
+            await db.PasswordResets.Where(t => t.UserId == user.Id && !t.Used).ExecuteUpdateAsync(s => s.SetProperty(t => t.Used, true), ct);
+            db.PasswordResets.Add(new PasswordReset { UserId = user.Id, TokenHash = SessionService.Hash(credential), ExpiresAt = clock.GetUtcNow().UtcDateTime.AddMinutes(20) });
+            await db.SaveChangesAsync(ct);
+            await tx.CommitAsync(ct);
+            await mailer.SendAsync(user.Email!, credential, ct);
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error promoting user {UserId} to admin", id);
-            return StatusCode(500, new { message = "An error occurred while promoting the user", detail = ex.Message });
-        }
+        return Ok(new { message = RecoveryMessage });
     }
 
-    [Authorize(Roles = "Admin")]
-    [HttpPost("users/{id}/demote-to-user")]
-    public async Task<IActionResult> DemoteToUser(Guid id)
+    [AllowAnonymous, EnableRateLimiting("auth")]
+    [HttpPost("reset-password")]
+    public async Task<IActionResult> Reset(ResetPasswordDto dto, CancellationToken ct)
     {
-        try
+        if (!BrowserRequestAllowed()) return StatusCode(403, new { message = "Untrusted request origin or missing request header" });
+        var user = await users.FindByEmailAsync(dto.Email.Trim());
+        var invalid = new { message = "Reset link is invalid, expired, or already used" };
+        if (user == null || user.IsDeleted) return BadRequest(invalid);
+        var validation = new List<IdentityError>();
+        foreach (var validator in users.PasswordValidators)
         {
-            var user = await _userManager.FindByIdAsync(id.ToString());
-            if (user == null)
-            {
-                return NotFound(new { message = "User not found" });
-            }
-
-            var isAdmin = await _userManager.IsInRoleAsync(user, "Admin");
-            if (!isAdmin)
-            {
-                return BadRequest(new { message = "User is already not admin" });
-            }
-
-            var roleExists = await _roleManager.RoleExistsAsync("User");
-            if (!roleExists)
-            {
-                return BadRequest(new { message = "User role does not exist" });
-            }
-
-            await _userManager.RemoveFromRoleAsync(user, "Admin");
-            var result = await _userManager.AddToRoleAsync(user, "User");
-
-            if (!result.Succeeded)
-            {
-                return BadRequest(new { message = "Failed to demote admin", errors = result.Errors.Select(e => e.Description) });
-            }
-
-            try
-            {
-                var roles = await _userManager.GetRolesAsync(user);
-                await _userSyncService.UpdateUserInMongoDbAsync(user, roles.ToList());
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to sync promoted admin user {UserId} to MongoDB", user.Id);
-            }
-
-            _logger.LogInformation("User {UserId} demoted to user successfully", user.Id);
-            return Ok(new { message = "Admin demoted to user successfully" });
+            var checkedPassword = await validator.ValidateAsync(users, user, dto.Password);
+            validation.AddRange(checkedPassword.Errors);
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error demoting admin {UserId} to user", id);
-            return StatusCode(500, new { message = "An error occurred while promoting the user", detail = ex.Message });
-        }
+        if (validation.Count != 0) return BadRequest(new { message = "Password does not meet requirements", errors = validation.Select(e => e.Description) });
+        var hash = SessionService.Hash(dto.Token);
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        await LockAccount(user, ct);
+        if (user.IsDeleted) return BadRequest(invalid);
+        var used = await db.PasswordResets.Where(t => t.UserId == user.Id && t.TokenHash == hash && !t.Used && t.ExpiresAt > clock.GetUtcNow().UtcDateTime)
+            .ExecuteUpdateAsync(s => s.SetProperty(t => t.Used, true), ct);
+        if (used != 1) return BadRequest(invalid);
+        await db.PasswordResets.Where(t => t.UserId == user.Id && !t.Used)
+            .ExecuteUpdateAsync(s => s.SetProperty(t => t.Used, true), ct);
+        user.PasswordHash = users.PasswordHasher.HashPassword(user, dto.Password);
+        var update = await users.UpdateSecurityStampAsync(user);
+        if (!update.Succeeded) return StatusCode(503, new { message = "Password reset could not be saved" });
+        await sessions.RevokeUserAsync(user.Id, ct);
+        await tx.CommitAsync(ct);
+        ClearCookie();
+        return Ok(new { message = "Password reset. Sign in with your new password." });
     }
 
+    private async Task<object> UserContract(User user) => new { user.Id, username = user.UserName, user.Email, user.IsPrivate, user.CreatedAt, roles = await users.GetRolesAsync(user) };
+
+    private async Task LockAccount(User user, CancellationToken ct)
+    {
+        // A no-op conditional UPDATE takes the stable PostgreSQL row lock. Login cannot
+        // issue a session with a password/role snapshot that changed during authentication.
+        await db.Users.Where(u => u.Id == user.Id).ExecuteUpdateAsync(s => s.SetProperty(u => u.ConcurrencyStamp, u => u.ConcurrencyStamp), ct);
+        await db.Entry(user).ReloadAsync(ct);
+    }
+
+    [AllowAnonymous]
+    [HttpGet("internal/sessions/{sid:guid}")]
+    public async Task<IActionResult> ValidateSession(Guid sid, CancellationToken ct)
+    {
+        if (!ServiceAllowed()) return Unauthorized();
+        return await sessions.IsActiveAsync(sid, ct) ? NoContent() : Unauthorized();
+    }
+
+    [AllowAnonymous]
+    [HttpGet("internal/users/{id:guid}")]
+    public async Task<IActionResult> InternalUser(Guid id)
+    {
+        if (!ServiceAllowed()) return Unauthorized();
+        var user = await users.FindByIdAsync(id.ToString());
+        return user == null || user.IsDeleted ? NotFound() : Ok(await UserContract(user));
+    }
+
+    [AllowAnonymous]
+    [HttpGet("internal/users")]
+    public Task<IActionResult> InternalUsers(int page = 1, int pageSize = 100, CancellationToken ct = default) =>
+        ServiceAllowed() ? ListUsers(null, page, pageSize, ct) : Task.FromResult<IActionResult>(Unauthorized());
+
+    [AllowAnonymous]
+    [HttpPost("internal/profile")]
+    public async Task<IActionResult> InternalProfile(InternalProfileDto dto, CancellationToken ct)
+    {
+        if (!ServiceAllowed()) return Unauthorized();
+        var user = await users.FindByIdAsync(dto.IdentityUserId.ToString());
+        if (user == null || user.IsDeleted) return NotFound();
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        await LockAccount(user, ct);
+        if (user.IsDeleted) return NotFound();
+        if (dto.UserName != null) user.UserName = dto.UserName.Trim();
+        if (dto.IsPrivate.HasValue) user.IsPrivate = dto.IsPrivate.Value;
+        var result = await users.UpdateAsync(user);
+        if (!result.Succeeded) return Conflict(new { message = "Account fields could not be updated", errors = result.Errors.Select(e => e.Description) });
+        await profiles.EnqueueAsync(user.Id, ct: ct);
+        await tx.CommitAsync(ct);
+        if (!await profiles.ReconcileAsync(user.Id, ct)) return StatusCode(503, new { message = "Account updated; profile synchronization pending", pending = true });
+        return Ok(await UserContract(user));
+    }
 }
 
 public class RegisterDto
 {
-    [Required]
-    [StringLength(50, MinimumLength = 3)]
-    public string Username { get; set; } = string.Empty;
-
-    [Required]
-    [EmailAddress]
-    [StringLength(100)]
-    public string Email { get; set; } = string.Empty;
-
-    [Required]
-    [StringLength(100, MinimumLength = 8)]
-    public string Password { get; set; } = string.Empty;
-
-    [JsonPropertyName("name")]
-    public string? Name { get; set; }
-
+    [Required, StringLength(50, MinimumLength = 3), RegularExpression("^[a-zA-Z0-9_.-]+$")]
+    public string Username { get; set; } = "";
+    [Required, EmailAddress, StringLength(100)] public string Email { get; set; } = "";
+    [Required, StringLength(100, MinimumLength = 8)] public string Password { get; set; } = "";
+    [StringLength(100)] public string? Name { get; set; }
     public bool? IsPrivate { get; set; }
 }
-
 public class LoginDto
 {
-    [Required]
-    public string Username { get; set; } = string.Empty;
-
-    [Required]
-    public string Password { get; set; } = string.Empty;
-
-    public bool RememberMe { get; set; } = false;
+    [Required, StringLength(100)] public string Username { get; set; } = "";
+    [Required, StringLength(100)] public string Password { get; set; } = "";
+    public bool RememberMe { get; set; }
 }
-
 public class UpdateUserDto
 {
-    [EmailAddress]
-    [StringLength(100)]
-    public string? Email { get; set; }
-
+    [EmailAddress, StringLength(100)] public string? Email { get; set; }
     public bool? IsPrivate { get; set; }
 }
-
 public class ChangePasswordDto
 {
-    [Required]
-    public string CurrentPassword { get; set; } = string.Empty;
-
-    [Required]
-    [StringLength(100, MinimumLength = 8)]
-    public string NewPassword { get; set; } = string.Empty;
+    [Required, StringLength(100)] public string CurrentPassword { get; set; } = "";
+    [Required, StringLength(100, MinimumLength = 8)] public string NewPassword { get; set; } = "";
 }
-
-public class RefreshTokenDto
+public class ForgotPasswordDto
 {
-    [Required]
-    public string RefreshToken { get; set; } = string.Empty;
+    [Required, EmailAddress, StringLength(100)] public string Email { get; set; } = "";
+}
+public class ResetPasswordDto : ForgotPasswordDto
+{
+    [Required, StringLength(256)] public string Token { get; set; } = "";
+    [Required, StringLength(100, MinimumLength = 8)] public string Password { get; set; } = "";
+}
+public class InternalProfileDto
+{
+    [Required] public Guid IdentityUserId { get; set; }
+    [StringLength(50, MinimumLength = 3), RegularExpression("^[a-zA-Z0-9_.-]+$")] public string? UserName { get; set; }
+    public bool? IsPrivate { get; set; }
 }

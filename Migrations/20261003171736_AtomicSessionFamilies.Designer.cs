@@ -3,6 +3,7 @@ using System;
 using Identity.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace Identity.Migrations
 {
     [DbContext(typeof(IdentityDbContext))]
-    partial class IdentityDbContextModelSnapshot : ModelSnapshot
+    [Migration("20261003171736_AtomicSessionFamilies")]
+    partial class AtomicSessionFamilies
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -86,7 +89,8 @@ namespace Identity.Migrations
 
                     b.HasIndex("NextAttemptAt");
 
-                    b.HasIndex("UserId", "Delete");
+                    b.HasIndex("UserId", "Delete")
+                        .IsUnique();
 
                     b.ToTable("ProfileSyncWork");
                 });
@@ -108,23 +112,10 @@ namespace Identity.Migrations
                     b.Property<Guid>("FamilyId")
                         .HasColumnType("uuid");
 
-                    b.Property<bool>("IsPending")
-                        .HasColumnType("boolean");
-
                     b.Property<bool>("IsRevoked")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("boolean")
                         .HasDefaultValue(false);
-
-                    b.Property<string>("OperationHash")
-                        .HasMaxLength(64)
-                        .HasColumnType("character varying(64)");
-
-                    b.Property<DateTime?>("PreparationExpiresAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<Guid?>("PreparedFromId")
-                        .HasColumnType("uuid");
 
                     b.Property<Guid?>("ReplacedById")
                         .HasColumnType("uuid");
@@ -150,8 +141,6 @@ namespace Identity.Migrations
                         .IsUnique();
 
                     b.HasIndex("UserId");
-
-                    b.HasIndex("IsPending", "PreparationExpiresAt");
 
                     b.ToTable("RefreshTokens");
                 });

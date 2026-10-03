@@ -1,0 +1,480 @@
+{
+  "repository": "Identity",
+  "date": "2026-10-03",
+  "auditSource": "Original read-only spotibuds-audit/audit-findings.json preserved outside repositories",
+  "verification": {
+    "releaseBuild": "Passed: Identity.sln, zero warnings/errors",
+    "committedTests": "Passed: 16 real JWT/authorization middleware and persisted SQLite integration tests",
+    "liveStack": "Passed: 40 actual PostgreSQL/Mongo/Mailpit checks in ../Frontend/demo/identity-integration.mjs; result ../Frontend/demo/identity-verification.local.json",
+    "dependencyScan": "Official NuGet current compatible packages queried; dotnet list package --vulnerable --include-transitive reported no vulnerable packages",
+    "docker": "Latest Identity nonroot image built and started by shared demo Compose; readiness 200 and generated migrations applied",
+    "outageAndRestart": "Passed: 26 real dependency-outage/range/API-restart checks and two CLI status failure/recovery checks; pending refresh preparation survives API restart; all dependencies restored and volumes preserved; ../Frontend/demo/outage-verification.local.json"
+  },
+  "entries": [
+    {
+      "id": "IU-01",
+      "applicability": "Confirmed anonymous role mutation in original controller",
+      "correction": "Fallback authenticated policy; administrator-only allowlisted roles; authoritative synchronization and immediate target session revocation",
+      "changedFiles": [
+        "Controllers/AuthController.cs",
+        "IdentityServiceExtensions.cs",
+        "Services/ProfileReconciler.cs"
+      ],
+      "verification": [
+        "Anonymous and ordinary users rejected with 401/403; persisted role remains ordinary",
+        "Live synthetic promotion/demotion changes Mongo and JWT roles; old privileged access immediately rejected"
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-02",
+      "applicability": "Original arbitrary account email/privacy update was unauthenticated",
+      "correction": "Admin-only targeted update and claim-derived self route; synchronized privacy; email changes explicitly require verification and are unavailable in this demo",
+      "changedFiles": [
+        "Controllers/AuthController.cs",
+        "Services/ProfileReconciler.cs"
+      ],
+      "verification": [
+        "Anonymous/unrelated updates denied with no account state changes",
+        "Public/private seed privacy follows Identity authority"
+      ],
+      "status": "Fixed and verified",
+      "limitations": [
+        "External email confirmation/change is unavailable; UI must show this restriction"
+      ]
+    },
+    {
+      "id": "IU-06",
+      "applicability": "Identity individual account reads exposed another account email/roles; User owns broader privacy boundaries",
+      "correction": "Individual Identity details limited to self/Admin; bounded search excludes unrelated private accounts and omits email/roles",
+      "changedFiles": [
+        "Controllers/AuthController.cs"
+      ],
+      "verification": [
+        "Foreign account read returns 403 through actual JWT middleware",
+        "User real Mongo privacy tests cover anonymous/foreign/self/Admin direct and batch reads"
+      ],
+      "status": "Fixed and verified",
+      "limitations": [
+        "Shared finding: full User/Music privacy disposition recorded in their ledgers"
+      ]
+    },
+    {
+      "id": "IU-10",
+      "applicability": "Original refresh required a live access token",
+      "correction": "AllowAnonymous refresh authenticates solely through the HttpOnly refresh credential and explicit origin/request protections",
+      "changedFiles": [
+        "Controllers/AuthController.cs",
+        "Services/SessionService.cs"
+      ],
+      "verification": [
+        "Cookie refresh without bearer succeeds in WAF and live PostgreSQL stack",
+        "Missing/revoked/expired cookie denied"
+      ],
+      "status": "Fixed and verified",
+      "limitations": []
+    },
+    {
+      "id": "IU-11",
+      "applicability": "Original logout/password changes did not revoke sessions",
+      "correction": "Stable session families; logout family revocation; password/reset/role changes revoke all target sessions; sid validation on Identity and downstream APIs; hub expiration/invocation enforcement by User",
+      "changedFiles": [
+        "Controllers/AuthController.cs",
+        "Services/SessionService.cs",
+        "Entities/SessionFamily.cs",
+        "IdentityServiceExtensions.cs"
+      ],
+      "verification": [
+        "Logout rejects prior Identity/User/Music access token immediately",
+        "Password change revokes both simulated devices",
+        "Actual Mailpit reset revokes old refresh family",
+        "Real User hub invocation denied after revoked sid",
+        "Actual signed short-lived access token closes the live User SignalR connection at expiry"
+      ],
+      "status": "Fixed and verified",
+      "limitations": [
+        "Each downstream request validates sid through single local Identity service; dependency failure returns 503"
+      ]
+    },
+    {
+      "id": "IU-12",
+      "applicability": "Original read-then-rotate allowed duplicate successors",
+      "correction": "Hashed credentials; per-family PostgreSQL row lock and conditional consumption in one transaction; strict replay revokes entire family",
+      "changedFiles": [
+        "Services/SessionService.cs",
+        "Entities/RefreshToken.cs",
+        "Entities/SessionFamily.cs",
+        "Migrations/20261003171736_AtomicSessionFamilies.cs"
+      ],
+      "verification": [
+        "Four simultaneous refresh requests against PostgreSQL produce exactly one 200",
+        "Persisted family is revoked by replay; winner successor cannot authenticate or refresh"
+      ],
+      "status": "Fixed and verified",
+      "limitations": [
+        "A legitimate racing tab also triggers strict family revocation; frontend must coordinate refresh across tabs"
+      ]
+    },
+    {
+      "id": "IU-13",
+      "applicability": "Original provisioning skipped required Mongo failures and inserted duplicates",
+      "correction": "Required configuration; reusable non-null Mongo client; unique IdentityUserId index and idempotent upsert; durable PostgreSQL outbox committed with account creation; explicit pending 503",
+      "changedFiles": [
+        "Program.cs",
+        "Services/UserSyncService.cs",
+        "Services/ProfileReconciler.cs",
+        "Entities/ProfileSyncWork.cs",
+        "Data/IdentityDbContext.cs"
+      ],
+      "verification": [
+        "Fault-injected registration retains one account plus durable pending work and returns 503",
+        "Recovery/login produces one profile",
+        "Real missing profile repaired twice retains one canonical Mongo profile"
+      ],
+      "status": "Fixed and verified",
+      "limitations": [
+        "Single-instance reconciler; no distributed outbox leasing"
+      ]
+    },
+    {
+      "id": "IU-14",
+      "applicability": "Original privacy/role mutations could acknowledge divergence",
+      "correction": "Identity field ownership; immutable durable sync work per mutation; account-row serialization prevents stale remote overwrites; profile upsert preserves User-owned fields; typed internal account updates and explicit pending result",
+      "changedFiles": [
+        "Controllers/AuthController.cs",
+        "Services/UserSyncService.cs",
+        "Services/ProfileReconciler.cs",
+        "docs/LOCAL-CONTRACT.md"
+      ],
+      "verification": [
+        "Live promotion/demotion matches Mongo role and next JWT",
+        "Seed public/private profile edits applied through authority route",
+        "Four concurrent privacy mutations acknowledge completed remote writes and leave Mongo equal to PostgreSQL",
+        "Fault adapter proves pending work survives and retries"
+      ],
+      "status": "Fixed and verified",
+      "limitations": [
+        "No atomic cross-store transaction; pending results are explicit and retryable"
+      ]
+    },
+    {
+      "id": "IU-15",
+      "applicability": "Original account deletion swallowed incomplete Mongo cleanup",
+      "correction": "Disable account and revoke sessions transactionally; persist deletion outbox; retry User relation/avatar/Music playlist cleanup; delete Identity only after service acknowledgement",
+      "changedFiles": [
+        "Controllers/AuthController.cs",
+        "Services/UserSyncService.cs",
+        "Services/ProfileReconciler.cs",
+        "Entities/User.cs"
+      ],
+      "verification": [
+        "WAF cleanup outage returns 202, disables account and preserves durable retry work",
+        "Live account cleanup with repaired Music internal route removes PostgreSQL account/outbox and Mongo profile",
+        "Earlier old-image Music 404 was exposed as pending, not fake success"
+      ],
+      "status": "Fixed and verified",
+      "limitations": [
+        "Related User/Music cleanup invariants are owned and recorded by those repositories"
+      ]
+    },
+    {
+      "id": "IU-16",
+      "applicability": "Original profile recovery used unauthenticated incompatible account endpoints",
+      "correction": "Fresh shared service credential and restricted typed internal user/list contract; correctly bounded envelope and case-insensitive User deserialization",
+      "changedFiles": [
+        "Controllers/AuthController.cs",
+        "docs/LOCAL-CONTRACT.md"
+      ],
+      "verification": [
+        "Live deletion of synthetic profile followed by two trusted repairs restores canonical username/privacy/roles once",
+        "Internal account route denied without service secret"
+      ],
+      "status": "Fixed and verified",
+      "limitations": [
+        "User's shared service client and recovery implementation recorded in User ledger"
+      ]
+    },
+    {
+      "id": "IU-19",
+      "applicability": "Identity connection diagnostic published/logged connection-string prefixes",
+      "correction": "Remove diagnostic route; sanitized structured error type and trace ID; no connection prefixes or stack traces returned",
+      "changedFiles": [
+        "Controllers/AuthController.cs",
+        "Program.cs"
+      ],
+      "verification": [
+        "Authenticated diagnostic request returns 404",
+        "Runtime dependency failures contain only generic failures and operational IDs"
+      ],
+      "status": "Fixed and verified",
+      "limitations": [
+        "Historical external log exposure/revocation is not claimed"
+      ]
+    },
+    {
+      "id": "IU-26",
+      "applicability": "Identity administrator lists performed unbounded serial role lookups",
+      "correction": "Bounded pagination and bulk role join; literal bounded search; cancellable EF operations",
+      "changedFiles": [
+        "Controllers/AuthController.cs"
+      ],
+      "verification": [
+        "Invalid zero page size returns 400",
+        "Live admin workflows and test role lists use canonical bounded envelopes"
+      ],
+      "status": "Fixed and verified",
+      "limitations": [
+        "Shared User performance work recorded separately; no production-scale load claim"
+      ]
+    },
+    {
+      "id": "IU-R03",
+      "applicability": "Plaintext refresh credentials and mixed bearer/refresh authorization",
+      "correction": "SHA-256 hashes at rest; HttpOnly cookie transport; refresh possession model and stable family identity; no raw JSON credentials",
+      "changedFiles": [
+        "Services/SessionService.cs",
+        "Controllers/AuthController.cs",
+        "Entities/RefreshToken.cs"
+      ],
+      "verification": [
+        "Persisted PostgreSQL hashes are exactly 64 hex characters",
+        "Cookie HttpOnly/SameSite flags verified",
+        "Replay/revocation/expiry negative cases and cross-service sid denials pass"
+      ],
+      "status": "Fixed and verified",
+      "limitations": [
+        "Loopback HTTP cookie requires explicit Development; other environments require HTTPS"
+      ]
+    },
+    {
+      "id": "IU-R04",
+      "applicability": "Original Identity had no behavioral test project",
+      "correction": "Committed real middleware/persisted DB integration suite; full-stack state assertions; User real Mongo/hub suite additionally authored",
+      "changedFiles": [
+        "tests/Identity.Tests/Identity.Tests.csproj",
+        "tests/Identity.Tests/IdentityFactory.cs",
+        "tests/Identity.Tests/SessionIntegrationTests.cs",
+        "Identity.sln"
+      ],
+      "verification": [
+        "Identity 12 tests pass Debug and Release",
+        "Live 40 checks pass against isolated PostgreSQL/Mongo/Mailpit",
+        "User 19 tests pass with zero skips against isolated real Mongo, SignalR long polling and actual Blob storage"
+      ],
+      "status": "Fixed and verified",
+      "limitations": [
+        "Browser acceptance is tracked in shared ledger; no mock-only helper claim"
+      ]
+    },
+    {
+      "id": "IU-R05",
+      "applicability": "Advertised recovery and public account rate limits absent",
+      "correction": "Guest reset flow with actual Mailpit SMTP; expiring hashed single-use tokens; generic known/unknown messages; lockout and local rate limiting; email-change limitation explicit",
+      "changedFiles": [
+        "Controllers/AuthController.cs",
+        "Services/RecoveryMailer.cs",
+        "Entities/PasswordReset.cs",
+        "Program.cs"
+      ],
+      "verification": [
+        "Actual captured reset message used successfully once",
+        "Invalid/reused/expired tokens rejected and previous sessions revoked",
+        "Mailer outage adapter returns same 503 for known/unknown"
+      ],
+      "status": "Fixed and verified",
+      "limitations": [
+        "External email confirmation and delivery are production-only follow-ups; public endpoints limited to 100 requests/minute per IP"
+      ]
+    },
+    {
+      "id": "O-02",
+      "applicability": "Original Identity dependencies were older compatible patches",
+      "correction": "Official NuGet latest compatible .NET8 patches 8.0.31, Npgsql EF8 8.0.11, Mongo 3.12.0; remove unused packages; dependency lockfile; current runtime image",
+      "changedFiles": [
+        "Identity.csproj",
+        "packages.lock.json",
+        "Dockerfile"
+      ],
+      "verification": [
+        "Release build zero warnings",
+        "Official NuGet vulnerability scan zero vulnerable packages",
+        "Runtime image builds and starts"
+      ],
+      "status": "Fixed and verified",
+      "limitations": [
+        ".NET8 support ends November 2026; future production migration requires maintained runtime"
+      ]
+    },
+    {
+      "id": "O-03",
+      "applicability": "Historical credential material remains in existing Git history",
+      "correction": "Remove tracked current credentials; require generated fresh local secrets; safe ignored environment examples; isolate all task-created resources",
+      "changedFiles": [
+        "appsettings.json",
+        "appsettings.Development.json",
+        ".env.example",
+        "Program.cs"
+      ],
+      "verification": [
+        "Fresh local generated credentials used for isolated demo",
+        "Required config has no historical/production fallback"
+      ],
+      "status": "Mitigated for the local demo",
+      "limitations": [
+        "Git history was preserved; historical external credentials were not validated or revoked. External rotation and any history rewrite require owners"
+      ]
+    },
+    {
+      "id": "O-04",
+      "applicability": "Original Identity PR workflow pushed/deployed cloud images",
+      "correction": "Read-only validation workflow builds/tests/scans and local Docker build; all registry/cloud deployment actions removed",
+      "changedFiles": [
+        ".github/workflows/ci-cd.yml"
+      ],
+      "verification": [
+        "Source workflow contains no deployment/push/secrets action",
+        "Equivalent local Release build and regression checks pass"
+      ],
+      "status": "Mitigated for the local demo",
+      "limitations": [
+        "Remote CI run not triggered because no push/publish was authorized"
+      ]
+    },
+    {
+      "id": "O-06",
+      "applicability": "Original Identity forced port80 regardless configuration",
+      "correction": "Honor ASPNETCORE configuration; internal8080/publicloopback5101 with versioned Compose; mandatory explicit JWT/CORS/dependency config",
+      "changedFiles": [
+        "Program.cs",
+        "Dockerfile",
+        ".env.example",
+        "docs/LOCAL-CONTRACT.md"
+      ],
+      "verification": [
+        "Complete local APIs run without port collision; Identity readiness200 and real contracts pass"
+      ],
+      "status": "Fixed and verified",
+      "limitations": [
+        "Shared setup is versioned in Frontend/demo because workspace root is not one Git repository"
+      ]
+    },
+    {
+      "id": "O-R02",
+      "applicability": "Original Identity runtime used root and broad Docker context",
+      "correction": "Runtime USER APP_UID; ignore credentials/Git/tests/build artifacts; current supported runtime patch",
+      "changedFiles": [
+        "Dockerfile",
+        ".dockerignore"
+      ],
+      "verification": [
+        "Nonroot container image built/started and accounts/Mailpit flow work"
+      ],
+      "status": "Mitigated for the local demo",
+      "limitations": [
+        "Production image hardening/registry scanning and cloud deployment policies are separate follow-ups"
+      ]
+    },
+    {
+      "id": "O-07",
+      "applicability": "Identity had no README and setup documents used inconsistent issuer/audience and omitted password requirements",
+      "correction": "Add Identity README pointing to the authoritative sibling-repository PowerShell setup and environment matrix; document GUID/ObjectId distinction, current session contracts and the exact password policy",
+      "changedFiles": [
+        "README.md",
+        "docs/LOCAL-CONTRACT.md",
+        "appsettings.json",
+        ".env.example"
+      ],
+      "verification": [
+        "Shared issuer/audience used by real sign-in, User/Music requests and 40 full-stack checks",
+        "Repeated documented seed succeeds without duplicated relationships"
+      ],
+      "status": "Fixed and verified",
+      "limitations": [
+        "Shared fresh-start instructions and browser checks recorded in the workspace ledger"
+      ]
+    },
+    {
+      "id": "NEW-I-01",
+      "applicability": "Concurrent password/role changes could race a login's authenticated snapshot",
+      "correction": "Login and password/role mutations lock the stable account row; re-read the account before credential check and session issuance; preserve lockout commits",
+      "changedFiles": [
+        "Controllers/AuthController.cs"
+      ],
+      "verification": [
+        "All twelve middleware/persisted regression tests pass after locking change",
+        "Live role transitions revoke old privilege and issue current role only",
+        "Four old-password logins racing password change leave every returned old session revoked and zero persisted active families"
+      ],
+      "status": "Fixed and verified",
+      "limitations": [
+        "No hostile unbounded concurrency/load test performed"
+      ]
+    },
+    {
+      "id": "NEW-I-02",
+      "applicability": "An older in-flight reconciliation could overwrite a newer acknowledged remote profile after both immutable work rows were removed",
+      "correction": "All authority mutations and reconciliations acquire the same PostgreSQL account row lock, re-read canonical fields, and retain outbox work until the serialized remote write is acknowledged",
+      "changedFiles": [
+        "Services/ProfileReconciler.cs",
+        "Controllers/AuthController.cs",
+        "docs/LOCAL-CONTRACT.md"
+      ],
+      "verification": [
+        "All twelve middleware/persisted regressions pass in Release after serialization",
+        "Four concurrent real PostgreSQL privacy mutations finish with Mongo equal to the canonical authority",
+        "Live integration runner passes all 40 checks"
+      ],
+      "status": "Fixed and verified",
+      "limitations": [
+        "Single-instance bounded reconciler; no distributed leasing/load test"
+      ]
+    },
+    {
+      "id": "NEW-S01",
+      "applicability": "Actual browser hard reload discarded a refresh response cookie after one-step credential consumption, causing the next bootstrap to replay its consumed predecessor",
+      "correction": "Two-phase browser refresh installs a pending cookie before consuming its predecessor, then activates that installed successor without another cookie response;30-second token-free operation coordination and hashed-only durable stages preserve strict consumed-token revocation",
+      "changedFiles": [
+        "Controllers/AuthController.cs",
+        "Services/SessionService.cs",
+        "Entities/RefreshToken.cs",
+        "Data/IdentityDbContext.cs",
+        "IdentityServiceExtensions.cs",
+        "Services/ProfileReconciler.cs",
+        "Migrations/20261003184832_BrowserCookieHandoff.cs",
+        "tests/Identity.Tests/SessionIntegrationTests.cs",
+        "../Frontend/demo/identity-integration.mjs",
+        "../Frontend/demo/outage-restart-integration.mjs"
+      ],
+      "verification": [
+        "Passed: 16 Identity persisted middleware/SQLite integration tests, including discarded prepare cookie, discarded completion body, exact nonce/expiry and strict predecessor replay assertions",
+        "Passed: full Chromium suite 21/21, including actual interrupted navigation recovery, protected playlists/reload, HttpOnly successor and logout",
+        "Passed: actual PostgreSQL live 40 asserts one pending hashed successor, same-intent concurrent completion retries, no completion cookie mutation and strict consumed-parent family revocation",
+        "Passed: final 26 outage checks plus two CLI status checks; an installed pending refresh cookie survives full API restart and activates without another Set-Cookie"
+      ],
+      "status": "Fixed and verified",
+      "limitations": [
+        "Single-instance local demo; operation coordination and preparation expire after 30 seconds",
+        "Restart persistence requires the same injected signing key; distributed replicas and key rotation are separate production concerns"
+      ]
+    },
+    {
+      "id": "NEW-I03",
+      "applicability": "Concurrent forgot-password requests could invalidate old links before either new insert, leaving multiple unused links; successful reset consumed only its selected credential",
+      "correction": "Forgot-password issuance locks and reloads the same account row, invalidates older links and inserts the newest within one transaction; successful reset invalidates every other outstanding link under its existing account lock",
+      "changedFiles": [
+        "Controllers/AuthController.cs",
+        "tests/Identity.Tests/SessionIntegrationTests.cs",
+        "../Frontend/demo/identity-integration.mjs"
+      ],
+      "verification": [
+        "Passed: persisted regression injects a second outstanding link, resets with the selected link, proves both are consumed, rejects the other link and authenticates only with the resulting password",
+        "Passed: actual PostgreSQL/Mailpit live 40 concurrently requests four links, asserts exactly one current link, selects its actual email by stored hash and invalidates every outstanding link on successful reset"
+      ],
+      "status": "Fixed and verified",
+      "limitations": [
+        "Reset mail is delivered only to the isolated local Mailpit sink; production email verification and delivery are separate follow-ups"
+      ]
+    }
+  ]
+}
