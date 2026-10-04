@@ -16,7 +16,9 @@ builder.Logging.ClearProviders();
 builder.Logging.AddSimpleConsole(options => options.SingleLine = true);
 var config = builder.Configuration;
 foreach (var key in new[] { "ConnectionStrings:DefaultConnection", "ConnectionStrings:MongoDb", "MongoDB:DatabaseName",
-    "UserService:BaseUrl", "ServiceAuth:Secret", "Frontend:PublicUrl", "Smtp:Host", "Smtp:From" }) config.Required(key);
+    "UserService:BaseUrl", "ServiceAuth:Secret", "Frontend:PublicUrl" }) config.Required(key);
+if (config.GetValue("Smtp:Enabled", true))
+    foreach (var key in new[] { "Smtp:Host", "Smtp:From" }) config.Required(key);
 if (config.Required("ServiceAuth:Secret").Length < 32) throw new InvalidOperationException("ServiceAuth:Secret requires at least 32 characters");
 if (!builder.Environment.IsDevelopment() && !builder.Environment.IsEnvironment("Test") &&
     new Uri(config.Required("Frontend:PublicUrl")).Scheme != "https")

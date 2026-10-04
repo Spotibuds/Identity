@@ -281,6 +281,8 @@ public class AuthController(UserManager<User> users, RoleManager<IdentityRole<Gu
     {
         if (!BrowserRequestAllowed()) return StatusCode(403, new { message = "Untrusted request origin or missing request header" });
         // Check the local sink for both known and unknown addresses, so an outage does not enumerate accounts.
+        if (!config.GetValue("Smtp:Enabled", true))
+            return StatusCode(503, new { message = "Password reset email is not configured yet. Contact the site owner for help signing in." });
         await mailer.CheckAvailableAsync(ct);
         var user = await users.FindByEmailAsync(dto.Email.Trim());
         if (user != null && !user.IsDeleted)

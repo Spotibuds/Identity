@@ -4,6 +4,8 @@ using System.Net.Http.Json;
 using System.Text.Json.Nodes;
 using Identity.Services;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 
 namespace Identity.Tests;
@@ -11,6 +13,24 @@ namespace Identity.Tests;
 public class SessionIntegrationTests
 {
     private const string Password = "DemoTest!123";
+    [Fact]
+    public async Task DisabledRecoveryIsExplicitAndDoesNotRevealAccountsOrCreateTokens()
+    {
+        using var factory = new IdentityFactory(); await factory.InitializeAsync(); using var client = Client(factory);
+        await Register(client, "alice");
+        factory.Services.GetRequiredService<IConfiguration>()["Smtp:Enabled"] = "false";
+        factory.Mailer.Fail = true;
+        using var known = await client.PostAsJsonAsync("/api/auth/forgot-password", new { email = "alice@spotibuds.local" });
+        using var unknown = await client.PostAsJsonAsync("/api/auth/forgot-password", new { email = "unknown@spotibuds.local" });
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, known.StatusCode);
+        Assert.Equal(known.StatusCode, unknown.StatusCode);
+        var body = await known.Content.ReadAsStringAsync();
+        Assert.Contains("Password reset email is not configured yet", body);
+        Assert.Equal(body, await unknown.Content.ReadAsStringAsync());
+        Assert.False(await factory.InspectAsync(db => db.PasswordResets.AnyAsync()));
+        Assert.Null(factory.Mailer.Token);
+        await Login(client, "alice");
+    }
     private static HttpClient Client(IdentityFactory factory)
     {
         var client = factory.CreateClient(new Microsoft.AspNetCore.Mvc.Testing.WebApplicationFactoryClientOptions { HandleCookies = false });

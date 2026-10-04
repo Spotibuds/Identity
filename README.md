@@ -24,6 +24,13 @@ routes and durable reconciliation. [`.env.example`](.env.example) lists mandator
 settings without operational credentials. No cloud or historical configuration
 is used as a fallback.
 
+Deployments without an email relay can explicitly set `Smtp__Enabled=false`.
+Sign-in remains available; password-reset requests return a clear 503 without
+creating a reset token or disclosing whether the account exists. When enabling
+email, configure `Smtp__Host`, `Smtp__Port` and `Smtp__From` first. The current
+mailer expects a trusted SMTP relay without authentication or TLS; do not expose
+that relay publicly.
+
 From this repository, verify locally with:
 
 ```powershell
